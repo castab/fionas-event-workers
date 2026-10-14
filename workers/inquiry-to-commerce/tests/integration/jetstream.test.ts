@@ -48,12 +48,39 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
   const nc = admin;
   t.after(() => nc.close());
   const manager = await jetstreamManager(nc);
+  const setupEnv = { ...process.env, NATS_URL: url, NATS_USER: 'fionas-admin', NATS_PASSWORD: 'fionas-admin-dev',
+    NATS_CREDS_FILE: '', COMMERCE_SERVICE_ID: '', COMMERCE_SERVICE_SECRET: '', COMMERCE_BASE_URL: '' };
+  await assert.rejects(exec(process.execPath, ['scripts/nats-setup.mjs', '--non-interactive'], { env: setupEnv }), error => {
+    assert.match((error as { stderr: string }).stderr, /existing input stream/); return true;
+  });
+  await assert.rejects(manager.streams.info(OUTPUT_STREAM), /stream not found/i);
   await manager.streams.add({ name: INPUT_STREAM, subjects: ['fionas.inquiries.>'], storage: StorageType.File,
     retention: RetentionPolicy.Limits, max_age: 30 * 86_400_000_000_000, duplicate_window: 86_400_000_000_000 });
   const initialConfig = (await manager.streams.info(INPUT_STREAM)).config;
-  await provision(manager); await provision(manager);
+  const created = await exec(process.execPath, ['scripts/nats-setup.mjs', '--non-interactive'], { env: setupEnv });
+  assert.match(created.stdout, /FIONAS_EVENTS: created.*inquiry-to-commerce: created/);
+  assert.match(created.stdout, /"duplicate_window": 86400000000000/);
+  assert.equal(created.stdout.includes('fionas-admin-dev'), false);
+  // Exercise npm option forwarding as well as direct packaged-script execution.
+  assert.ok(process.env.npm_execpath, 'Run integration tests through npm run test:integration.');
+  const verified = await exec(process.execPath, [process.env.npm_execpath, 'run', 'nats:setup', '--', '--non-interactive', '--retention-days', '30', '--replicas', '1'],
+    { env: setupEnv });
+  assert.match(verified.stdout, /FIONAS_EVENTS: verified.*inquiry-to-commerce: verified/);
   assert.deepEqual((await manager.streams.info(INPUT_STREAM)).config, initialConfig);
   await assert.rejects(provision(manager, 31), /max_age/);
+  const outputConfig = (await manager.streams.info(OUTPUT_STREAM)).config;
+  await assert.rejects(exec(process.execPath, ['scripts/nats-setup.mjs', '--non-interactive', '--retention-days', '31'], { env: setupEnv }), error => {
+    const stderr = (error as { stderr: string }).stderr;
+    assert.match(stderr, /"property": "max_age"/); assert.match(stderr, /"existing"/); assert.match(stderr, /"desired"/); return true;
+  });
+  assert.deepEqual((await manager.streams.info(OUTPUT_STREAM)).config, outputConfig);
+  await manager.consumers.update(INPUT_STREAM, CONSUMER, { max_ack_pending: 2 });
+  const mismatchedConsumer = (await manager.consumers.info(INPUT_STREAM, CONSUMER)).config;
+  await assert.rejects(exec(process.execPath, ['scripts/nats-setup.mjs', '--non-interactive'], { env: setupEnv }), error => {
+    assert.match((error as { stderr: string }).stderr, /max_ack_pending/); return true;
+  });
+  assert.deepEqual((await manager.consumers.info(INPUT_STREAM, CONSUMER)).config, mismatchedConsumer);
+  await manager.consumers.update(INPUT_STREAM, CONSUMER, { max_ack_pending: 1 });
   assert.equal((await manager.streams.info(OUTPUT_STREAM)).config.max_age, 30 * 86_400_000_000_000);
   verifyInputConsumer((await manager.consumers.info(INPUT_STREAM, CONSUMER)).config);
 
@@ -176,4 +203,27 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
   assert.equal(output.includes('jane@example.com'), false);
   assert.equal(output.includes(service.secret), false);
   assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 2);
+
+  // The production-only image contains the .mjs script and its compiled dependencies.
+  const dockerSetup = await exec('docker', ['run', '--rm', '--network', `container:${container}`,
+    '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=fionas-admin', '-e', 'NATS_PASSWORD=fionas-admin-dev',
+    '--entrypoint', 'node', 'fionas-inquiry-to-commerce:test', 'scripts/nats-setup.mjs', '--non-interactive']);
+  assert.match(dockerSetup.stdout, /FIONAS_EVENTS: verified.*inquiry-to-commerce: verified/);
+  assert.equal(dockerSetup.stdout.includes('fionas-admin-dev'), false);
+  const imageWorker = `fionas-workers-image-test-${randomUUID()}`;
+  await exec('docker', ['run', '-d', '--name', imageWorker, '--network', `container:${container}`,
+    '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=inquiry-to-commerce', '-e', 'NATS_PASSWORD=inquiry-to-commerce-dev',
+    '-e', 'COMMERCE_BASE_URL=http://127.0.0.1:8080', '-e', `COMMERCE_SERVICE_ID=${service.serviceId}`, '-e', `COMMERCE_SERVICE_SECRET=${service.secret}`,
+    'fionas-inquiry-to-commerce:test']);
+  t.after(async () => { await exec('docker', ['rm', '-f', imageWorker]); });
+  await waitUntil(async () => {
+    const logs = await exec('docker', ['logs', imageWorker]);
+    assert.equal(logs.stderr.includes('startup_failed'), false, logs.stderr);
+    return logs.stdout.includes('durable_consumer_available');
+  });
+  await exec('docker', ['stop', '--time', '60', imageWorker]);
+  assert.match((await exec('docker', ['logs', imageWorker])).stdout, /worker_stopped/);
+  assert.equal((await exec('docker', ['inspect', '--format', '{{.State.ExitCode}}', imageWorker])).stdout.trim(), '0');
+  assert.equal((await exec('docker', ['inspect', '--format', '{{.Config.User}}', imageWorker])).stdout.trim(), 'node');
+  assert.deepEqual((await manager.streams.info(INPUT_STREAM)).config, initialConfig);
 });

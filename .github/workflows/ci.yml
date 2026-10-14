@@ -18,6 +18,4 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - run: npm run build --workspace @fionas/inquiry-to-commerce
       - run: npm run test:integration
-      - run: docker build -f workers/inquiry-to-commerce/Dockerfile -t fionas-inquiry-to-commerce:ci .

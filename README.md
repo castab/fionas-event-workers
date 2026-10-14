@@ -63,7 +63,7 @@ npm run build --workspace @fionas/inquiry-to-commerce
 npm run test:integration
 ```
 
-Ordinary tests use pure fixtures and local HTTP stubs. Integration tests automatically create a disposable real NATS 2.14.7 container/account on a random localhost port, check least-privilege processing, lost HTTP/PubAck recovery, restart/redelivery and independent consumers, then remove only their own container and anonymous volume. No production secrets, backend or PostgreSQL are needed. Docker must be running; integration does not silently skip.
+Ordinary tests use pure fixtures and local HTTP stubs, including interactive prompt/password tests. Integration tests build the production worker image, automatically create a disposable real NATS 2.14.7 container/account on a random localhost port, check provisioning, least-privilege processing, lost HTTP/PubAck recovery, restart/redelivery and independent consumers, and exercise the packaged setup script and normal worker startup. They then remove only their own containers and anonymous volume. No production secrets, backend or PostgreSQL are needed. Docker must be running; integration does not silently skip.
 
 For an isolated development broker:
 
@@ -86,15 +86,25 @@ To use the existing fionas-web broker instead, do not start a competing service 
 
 ## Operator provisioning and SERVICE setup
 
-Production setup expects `FIONAS_INQUIRIES` to exist already with file storage, limits retention and `fionas.inquiries.>`. It never creates or modifies that stream. With a separate operator NATS identity in the same account:
+Production setup expects `FIONAS_INQUIRIES` to exist already with file storage, limits retention and `fionas.inquiries.>`. It never creates or modifies that stream. Both streams use the worker's single NATS connection/account. Run the interactive setup with a separate operator NATS identity:
 
 ```sh
-# Export NATS_URL and NATS_CREDS_FILE for the operator; unset NATS_USER/NATS_PASSWORD.
+npm run nats:setup
+# Optional settings; cluster deployments normally choose --replicas 3.
 npm run nats:setup -- --retention-days 30 --replicas 1
-# Cluster deployments normally choose --replicas 3.
 ```
 
-Setup creates missing `FIONAS_EVENTS` and `inquiry-to-commerce`, or verifies managed settings. It reports mismatches and exits unsuccessfully, with no update operation. Operators must deliberately reconcile differences. Previously created resources are not rolled back if a later verification fails. Outcomes use file storage, limits retention, 30-day default finite retention, a 24-hour duplicate window and disabled message deletion/purge/rollup. Retention days must be finite, positive integers. Review customer-data retention before increasing them.
+The command builds the worker and launches `scripts/nats-setup.mjs`. It asks for a `nats://` or `tls://` address (default `NATS_URL` or localhost), then an operator `.creds` path, username/password, or explicitly selected unauthenticated local development. Environment values supply prompt defaults; password characters/defaults are never displayed. Ctrl+C cancels and restores the terminal. Credentials stay in memory and are not written to a file. No commerce credentials or additional confirmation prompt are required.
+
+For automation, export `NATS_URL` and either `NATS_CREDS_FILE` or both `NATS_USER`/`NATS_PASSWORD`, then:
+
+```sh
+npm run nats:setup -- --non-interactive --retention-days 30 --replicas 1
+```
+
+Without a terminal, `--non-interactive` is required. Do not combine credentials-file and username/password variables. Direct `.mjs` execution requires an existing worker build (already included in the Docker image).
+
+Setup displays every explicitly managed stream/consumer property before provisioning, with NATS duration values in nanoseconds, then reports each resource as created or verified. It checks existing resources before creating missing ones and reports mismatched properties with existing/desired values, with no update operation. Operators must deliberately reconcile differences. If a creation fails after another resource was created, that new resource is retained; rerunning safely verifies it. Outcomes use file storage, limits retention, 30-day default finite retention, a 24-hour duplicate window and disabled message deletion/purge/rollup. Retention days must be finite, positive integers. Review customer-data retention before increasing them.
 
 In commerce, log in as an authorized administrator, with its existing trusted Origin requirements. Use the existing administration endpoints to:
 
@@ -129,7 +139,7 @@ The second ACK pattern supports domain/account-hash ACK subjects while staying s
 | `COMMERCE_SERVICE_SECRET` | SERVICE credential; exclusive with secret file |
 | `COMMERCE_SERVICE_SECRET_FILE` | Mounted UTF-8 credential alternative; surrounding file whitespace trimmed |
 
-Startup validates configuration and verifies the existing durable configuration. Secrets never enter logs. Setup requires only the NATS variables. No tunable HTTP/concurrency framework is exposed; the initial defaults are explicit in source.
+Startup validates configuration and verifies the existing durable configuration. Secrets never enter logs. Interactive setup prompts for its NATS configuration; automated setup requires only NATS variables. No tunable HTTP/concurrency framework is exposed; the initial defaults are explicit in source.
 
 ```sh
 docker build -f workers/inquiry-to-commerce/Dockerfile -t fionas-inquiry-to-commerce:local .
@@ -138,6 +148,19 @@ docker run --rm --name inquiry-to-commerce --stop-timeout 60 \
 ```
 
 The image compiles in a build stage, installs production dependencies only in the runtime stage, runs as `node`, and exposes no port. If NATS/commerce run on the Docker host, use `host.docker.internal` on Docker Desktop in the environment supplied to the container. On Linux use the appropriate Docker network or add `--add-host=host.docker.internal:host-gateway`. Mount secret files read-only at their configured paths; do not bake them into the image.
+
+The same image packages the interactive setup script. Run it as a separate operator command; normal worker startup does not provision resources:
+
+```sh
+docker run --rm -it --entrypoint node fionas-inquiry-to-commerce:local scripts/nats-setup.mjs
+# With a read-only operator credentials mount (readable by the image's node user):
+docker run --rm -it --entrypoint node \
+  --mount type=bind,src=/absolute/path/operator.creds,dst=/run/secrets/operator.creds,readonly \
+  -e NATS_CREDS_FILE=/run/secrets/operator.creds \
+  fionas-inquiry-to-commerce:local scripts/nats-setup.mjs
+```
+
+Enter a server reachable from the container, e.g. `nats://host.docker.internal:4222` on Docker Desktop, and accept the mounted credentials-path default. Use your platform's absolute source path for the bind mount. For automation omit `-it`, supply the NATS environment variables/mount, and append `--non-interactive`; the image needs no build step at execution time.
 
 ## Delivery and operations
 

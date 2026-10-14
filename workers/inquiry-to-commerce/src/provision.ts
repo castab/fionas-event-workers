@@ -32,23 +32,32 @@ export function differences(existing: object, desired: object): string[] {
   return Object.entries(desired).flatMap(([key, value]) =>
     JSON.stringify(actual[key]) === JSON.stringify(value) ? [] : [key]);
 }
+export class ProvisioningMismatch extends Error {
+  readonly details: Array<{ property: string; existing: unknown; desired: unknown }>;
+  constructor(resource: string, existing: object, desired: object, keys: string[]) {
+    super(`${resource} configuration mismatch: ${keys.join(', ')}. Nothing updated.`);
+    const actual = existing as Record<string, unknown>;
+    const expected = desired as Record<string, unknown>;
+    this.details = keys.map(property => ({ property, existing: actual[property] ?? null, desired: expected[property] ?? null }));
+  }
+}
 export function verifyInputConsumer(config: ConsumerConfig): void {
   const mismatches = differences(config, inputConsumerConfig());
   if (config.deliver_subject) mismatches.push('deliver_subject');
   if (config.filter_subjects?.length) mismatches.push('filter_subjects');
   if (config.backoff?.length) mismatches.push('backoff');
   if (config.inactive_threshold) mismatches.push('inactive_threshold');
-  if (mismatches.length) throw new Error(`Input consumer configuration mismatch: ${mismatches.join(', ')}`);
+  if (mismatches.length) throw new ProvisioningMismatch('Input consumer', config, inputConsumerConfig(), mismatches);
 }
 
-export async function provision(manager: JetStreamManager, retentionDays = 30, replicas = 1): Promise<void> {
+export async function provision(manager: JetStreamManager, retentionDays = 30, replicas = 1): Promise<{ stream: 'created' | 'verified'; consumer: 'created' | 'verified' }> {
+  const desiredStream = outcomeStreamConfig(retentionDays, replicas);
   // Verify existing input only; never create, update or replace the producer's stream.
   const input = await manager.streams.info(INPUT_STREAM);
   if (input.config.storage !== StorageType.File || input.config.retention !== RetentionPolicy.Limits ||
     JSON.stringify(input.config.subjects) !== JSON.stringify(['fionas.inquiries.>'])) {
     throw new Error('FIONAS_INQUIRIES must already exist with file storage, limits retention and fionas.inquiries.>');
   }
-  const desiredStream = outcomeStreamConfig(retentionDays, replicas);
   let existingStream;
   try { existingStream = await manager.streams.info(OUTPUT_STREAM); }
   catch (error) {
@@ -56,13 +65,16 @@ export async function provision(manager: JetStreamManager, retentionDays = 30, r
   }
   if (existingStream) {
     const diff = differences(existingStream.config, desiredStream);
-    if (diff.length) throw new Error(`FIONAS_EVENTS configuration mismatch: ${diff.join(', ')}. Nothing updated.`);
-  } else { await manager.streams.add(desiredStream); }
+    if (diff.length) throw new ProvisioningMismatch(OUTPUT_STREAM, existingStream.config, desiredStream, diff);
+  }
   let existingConsumer;
   try { existingConsumer = await manager.consumers.info(INPUT_STREAM, CONSUMER); }
   catch (error) {
     if (!(error instanceof Error) || error.name !== 'ConsumerNotFoundError') throw error;
   }
   if (existingConsumer) verifyInputConsumer(existingConsumer.config);
-  else await manager.consumers.add(INPUT_STREAM, inputConsumerConfig());
+  // Preflight all existing resources before creating anything; never update a resource.
+  if (!existingStream) await manager.streams.add(desiredStream);
+  if (!existingConsumer) await manager.consumers.add(INPUT_STREAM, inputConsumerConfig());
+  return { stream: existingStream ? 'verified' : 'created', consumer: existingConsumer ? 'verified' : 'created' };
 }

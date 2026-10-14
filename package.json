@@ -7,10 +7,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc -p workers/inquiry-to-commerce/tsconfig.json",
-    "test": "node --test workers/inquiry-to-commerce/tests/*.test.ts",
-    "test:integration": "node --test workers/inquiry-to-commerce/tests/integration/*.test.ts",
+    "test": "node --test workers/inquiry-to-commerce/tests/*.test.*",
+    "test:integration": "npm run build --workspace @fionas/inquiry-to-commerce && docker build -f workers/inquiry-to-commerce/Dockerfile -t fionas-inquiry-to-commerce:test . && node --test workers/inquiry-to-commerce/tests/integration/*.test.ts",
     "start": "npm start --workspace @fionas/inquiry-to-commerce",
-    "nats:setup": "node scripts/nats-setup.ts",
+    "nats:setup": "npm run build --workspace @fionas/inquiry-to-commerce && node scripts/nats-setup.mjs",
     "nats:up": "docker compose up -d --wait nats",
     "nats:down": "docker compose down"
   },

@@ -46,7 +46,7 @@ Exhausted deliveries do not restart automatically. A straightforward deliberate 
    npm run nats:setup -- --retention-days 30 --replicas 1
    ```
 
-   Use the actual existing outcome retention/replica settings. Keep the CLI's confirmation prompt; this is an intentional consumer-position reset, not stream deletion. Setup creates the durable with DeliverAll and refuses outcome mismatches. Neither retained stream is deleted or recreated.
+   Use the actual existing outcome retention/replica settings. The setup command prompts for the NATS address and separate operator credentials; for automation supply the NATS environment and add `--non-interactive`. Keep the NATS CLI's deletion confirmation prompt; this is an intentional consumer-position reset, not stream deletion. Setup creates the durable with DeliverAll and refuses outcome mismatches. Neither retained stream is deleted or recreated.
 4. Restart the worker. It replays every retained matching input. Commerce returns the original receipt for committed UUIDs; deterministic outcomes deduplicate within the publish window. Check ACK logs and consumer pending state, and verify the originally failed sequence's eventual disposition.
 
 This recovery is intentionally broad and may revisit many successful events. On larger installations use an operator-reviewed targeted consumer-position recovery appropriate to the deployed NATS version, keeping earlier unresolved messages accounted for. Do not alter DeliverAll silently in the setup script or simply reset a consumer past the failed message. An independent consumer can inspect the same source without affecting this durable.

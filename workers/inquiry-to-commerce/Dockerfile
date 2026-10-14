@@ -16,6 +16,7 @@ COPY package.json package-lock.json ./
 COPY packages/events/package.json packages/events/package.json
 COPY workers/inquiry-to-commerce/package.json workers/inquiry-to-commerce/package.json
 RUN npm ci --omit=dev --workspace @fionas/inquiry-to-commerce && npm cache clean --force
-COPY --from=build /app/workers/inquiry-to-commerce/dist ./dist
+COPY --from=build /app/workers/inquiry-to-commerce/dist ./workers/inquiry-to-commerce/dist
+COPY scripts/nats-setup.mjs ./scripts/nats-setup.mjs
 USER node
-CMD ["node", "dist/workers/inquiry-to-commerce/src/main.js"]
+CMD ["node", "workers/inquiry-to-commerce/dist/workers/inquiry-to-commerce/src/main.js"]
