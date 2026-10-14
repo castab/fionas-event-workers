@@ -1,0 +1,15 @@
+services:
+  nats:
+    image: nats:2.14.7-alpine
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    ports: ["127.0.0.1:4222:4222", "127.0.0.1:8222:8222"]
+    volumes:
+      - ./infra/nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+volumes:
+  nats-data:

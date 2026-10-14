@@ -1,0 +1,8 @@
+.git
+.upstream
+.env*
+**/node_modules
+**/dist
+**/*.creds
+**/*.secret
+.test-data

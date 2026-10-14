@@ -1,0 +1,154 @@
+# Fiona's event workers
+
+A small Node.js 26 / TypeScript npm monorepo for independently deployed NATS JetStream integration workers. The public web application owns form choices and pricing; commerce owns inquiry persistence and its canonical initial Estimate. Workers connect those boundaries through events and HTTP.
+
+```mermaid
+flowchart LR
+  Web[fionas-web: form and pricing] --> In[(FIONAS_INQUIRIES)]
+  In --> Worker[inquiry-to-commerce durable pull worker]
+  Worker -->|SERVICE token, idempotent POST /inquiries| Commerce[fionas-commerce]
+  Commerce -->|committed receipt| Worker
+  Worker -->|confirmed PubAck| Out[(FIONAS_EVENTS)]
+  Out --> Future[Future independent workers]
+  Worker -->|ACK only after PubAck| In
+```
+
+`InquirySubmitted v1` announces a priced request accepted by the web server. It does not assert commerce persistence. `InquiryPersisted v1` announces a confirmed commerce commit, including enough contact information for a future acknowledgment email worker. No email worker is implemented here.
+
+## Structure and contracts
+
+```text
+workers/inquiry-to-commerce/  source, tests, independent build and Dockerfile
+packages/events/             narrow incoming types and owned outcome construction
+scripts/                     explicit operator setup and isolated local initialization
+infra/nats/                  local-only least-privilege NATS configuration
+docs/                        contract audit, operations and optional backend smoke test
+asyncapi.yaml                owned InquiryPersisted v1 contract
+```
+
+There is no inbound HTTP server, database, pricing logic or event framework. NATS uses `@nats-io/jetstream` and `@nats-io/transport-node` 3.4.0; HTTP uses native fetch. Dependencies are pinned in `package-lock.json`.
+
+| Resource | Name / subject |
+|---|---|
+| Existing input stream | `FIONAS_INQUIRIES`, subjects `fionas.inquiries.>` |
+| Input event | `fionas.inquiries.submitted.v1`, type `fionas.inquiry.submitted`, schemaVersion `1` |
+| Worker durable | `inquiry-to-commerce`, exclusively filtered to the input subject |
+| New outcome stream | `FIONAS_EVENTS`, subjects `fionas.events.>` |
+| Outcome event | `fionas.events.inquiry.persisted.v1`, type `fionas.inquiry.persisted`, schemaVersion `1` |
+
+The [upstream AsyncAPI](https://github.com/castab/fionas-web/blob/main/asyncapi.yaml) remains authoritative for incoming data. The worker validates structural usability, not commerce's financial or business rules. It ignores unknown additive fields and forwards a fixed projection:
+
+| Incoming property | HTTP / outcome mapping |
+|---|---|
+| `id` | HTTP `Idempotency-Key`; outcome `correlationId` |
+| `data.name`, `email`, `zipCode`, `eventDate`, `eventType` | Same fields in HTTP body, unchanged |
+| `data.message` | HTTP `message` only when present |
+| `data.requestedService` | `guestCount`, optional `guestCountIsMinimum`, ordered `items` with label/group/key, optional `pricingReference` |
+| `data.lines` | Complete ordered lines: description, optional subDescription/quantity, unitPrice, taxAmount, currency; exact strings unchanged |
+| Envelope and `data.priceRevision` | Not included in HTTP body; no separate revision or totals invented |
+| Commerce `201 {id, createdAt}` | Outcome `data.inquiryId`, `occurredAt`, retaining microsecond timestamp text |
+| Original name/email/eventDate | Outcome `data.customer.{name,email}` and `data.eventDate` |
+
+Outcome identity and `Nats-Msg-Id` are `fionas.inquiry.persisted.v1:<incoming-UUID>`. Serialization uses fixed field order. A repeat with the same input and receipt produces identical bytes. Outcome events contain no lines, ZIP, note, tokens or browser replay envelopes. See [asyncapi.yaml](asyncapi.yaml) and the [contract audit](docs/contract-audit.md).
+
+## Local development
+
+Install Node.js 26 and Docker, then from the repository root:
+
+```sh
+npm ci
+npm run typecheck
+npm test
+npm run build --workspace @fionas/inquiry-to-commerce
+npm run test:integration
+```
+
+Ordinary tests use pure fixtures and local HTTP stubs. Integration tests automatically create a disposable real NATS 2.14.7 container/account on a random localhost port, check least-privilege processing, lost HTTP/PubAck recovery, restart/redelivery and independent consumers, then remove only their own container and anonymous volume. No production secrets, backend or PostgreSQL are needed. Docker must be running; integration does not silently skip.
+
+For an isolated development broker:
+
+```sh
+npm run nats:up
+node scripts/nats-local-init.ts
+```
+
+The explicitly local initializer creates a missing development input stream and provisions outcomes/consumer. It uses public development credentials and hard-coded localhost. `npm run nats:down` stops it while preserving its named volume.
+
+Copy `.env.example` to `.env`, provision a dedicated commerce SERVICE as below, and replace its ID/secret. Start from source or the compiled workspace:
+
+```sh
+npm run dev --workspace @fionas/inquiry-to-commerce
+# Or build, export environment variables in your shell, then:
+npm start --workspace @fionas/inquiry-to-commerce
+```
+
+To use the existing fionas-web broker instead, do not start a competing service on port 4222. Add the worker identity's permissions from [infra/nats/nats-server.conf](infra/nats/nats-server.conf) to that local account without changing the public publisher's permissions, restart the local broker and run the operator setup. Its existing `fionas-web` identity remains publish-only.
+
+## Operator provisioning and SERVICE setup
+
+Production setup expects `FIONAS_INQUIRIES` to exist already with file storage, limits retention and `fionas.inquiries.>`. It never creates or modifies that stream. With a separate operator NATS identity in the same account:
+
+```sh
+# Export NATS_URL and NATS_CREDS_FILE for the operator; unset NATS_USER/NATS_PASSWORD.
+npm run nats:setup -- --retention-days 30 --replicas 1
+# Cluster deployments normally choose --replicas 3.
+```
+
+Setup creates missing `FIONAS_EVENTS` and `inquiry-to-commerce`, or verifies managed settings. It reports mismatches and exits unsuccessfully, with no update operation. Operators must deliberately reconcile differences. Previously created resources are not rolled back if a later verification fails. Outcomes use file storage, limits retention, 30-day default finite retention, a 24-hour duplicate window and disabled message deletion/purge/rollup. Retention days must be finite, positive integers. Review customer-data retention before increasing them.
+
+In commerce, log in as an authorized administrator, with its existing trusted Origin requirements. Use the existing administration endpoints to:
+
+1. Create a new SERVICE via `POST /admin/access/services`, named `inquiry-to-commerce`.
+2. Create a dedicated role, e.g. `fionas.inquiry-worker`, granting exactly `fionas.inquiries.create`.
+3. Assign it with `PUT /admin/access/services/{serviceId}/roles/fionas.inquiry-worker`.
+4. Issue a credential via `POST /admin/access/services/{serviceId}/credentials` with a label; capture the returned secret once in private configuration.
+
+Do not reuse fionas-web or staff credentials. The worker exchanges `{serviceId,secret}` at `/auth/service/token`, caches the short-lived Bearer token in memory and refreshes shortly before `expiresAt`. Inquiry `401` invalidates the token and retries the identical request once with a replacement; `403` does not refresh. No token-signing key is needed by the worker. Rotate credentials by issuing a replacement, deploying it, verifying it and revoking the old credential. [Upstream SERVICE documentation](https://github.com/castab/fionas-commerce/blob/main/README.md) describes the administrative request contracts.
+
+The runtime NATS user needs only these publish permissions and `_INBOX.>` subscriptions:
+
+```text
+$JS.API.CONSUMER.INFO.FIONAS_INQUIRIES.inquiry-to-commerce
+$JS.API.CONSUMER.MSG.NEXT.FIONAS_INQUIRIES.inquiry-to-commerce
+$JS.ACK.FIONAS_INQUIRIES.inquiry-to-commerce.>
+$JS.ACK.*.*.FIONAS_INQUIRIES.inquiry-to-commerce.>
+fionas.events.inquiry.persisted.v1
+```
+
+The second ACK pattern supports domain/account-hash ACK subjects while staying scoped to this stream/consumer. This configuration assumes the default `$JS.API` prefix, no JetStream domain prefix, and both streams in the same account. INFO is read-only and needed for binding/reconnect; runtime has no stream INFO, CREATE, UPDATE, DELETE, general consumer access or general JetStream administration. JWT credentials and TLS are recommended in production. Provision NATS identities through your existing operator/account tooling; this repository does not generate production credentials.
+
+## Environment and Docker
+
+| Variable | Purpose |
+|---|---|
+| `NATS_URL` | Required single `nats://` or `tls://` server URL without embedded credentials |
+| `NATS_CREDS_FILE` | Optional mounted JWT credentials path; exclusive with user/password |
+| `NATS_USER`, `NATS_PASSWORD` | Supported pair, development or operator-approved alternative |
+| `COMMERCE_BASE_URL` | Required HTTP(S) origin; no credentials, path, query or fragment |
+| `COMMERCE_SERVICE_ID` | Required dedicated SERVICE UUID |
+| `COMMERCE_SERVICE_SECRET` | SERVICE credential; exclusive with secret file |
+| `COMMERCE_SERVICE_SECRET_FILE` | Mounted UTF-8 credential alternative; surrounding file whitespace trimmed |
+
+Startup validates configuration and verifies the existing durable configuration. Secrets never enter logs. Setup requires only the NATS variables. No tunable HTTP/concurrency framework is exposed; the initial defaults are explicit in source.
+
+```sh
+docker build -f workers/inquiry-to-commerce/Dockerfile -t fionas-inquiry-to-commerce:local .
+docker run --rm --name inquiry-to-commerce --stop-timeout 60 \
+  --env-file .env fionas-inquiry-to-commerce:local
+```
+
+The image compiles in a build stage, installs production dependencies only in the runtime stage, runs as `node`, and exposes no port. If NATS/commerce run on the Docker host, use `host.docker.internal` on Docker Desktop in the environment supplied to the container. On Linux use the appropriate Docker network or add `--add-host=host.docker.internal:host-gateway`. Mount secret files read-only at their configured paths; do not bake them into the image.
+
+## Delivery and operations
+
+The worker pulls one message at a time; consumer `max_ack_pending=1`, `max_batch=1`. The 90-second ACK deadline exceeds bounded HTTP/token calls (10 seconds each), publish (5 seconds) and confirmed input ACK (5 seconds). No business success is inferred from a network write. Only a valid `201` receipt followed by the expected stream's successful PubAck permits input ACK; duplicate PubAck is success. Token or HTTP failures never publish outcomes.
+
+Transient failures (`429`, `5xx`, timeouts/connections, outgoing publication) use delayed NAK: 10s, 30s, 2m, 5m, then 15m. Likely permanent failures (invalid events, credentials/permission, `400`/`409`/`422`, malformed receipts, unexpected statuses) log `operator_attention_required` and use a one-hour delay. Maximum delivery count is 10. Failures are never ACKed or TERMed; exhausted messages remain inspectable until input-stream retention removes them. With one pending slot, an unresolved message can delay later work; recover promptly. Crash/no-ACK redelivery uses the 90-second deadline. See [operations](docs/operations.md) for pending/redelivery inspection, maximum-delivery advisories and recovery.
+
+SIGTERM/SIGINT stop new pulls and give current work up to 55 seconds. The deadline aborts HTTP and closes NATS; unfinished inputs stay unacknowledged. Set your supervisor's termination timeout to at least 60 seconds. The client reconnects indefinitely after established-connection failures; pull errors wait two seconds before retry. Startup failures exit nonzero for supervisor retry.
+
+This is **at-least-once delivery**. HTTP commit and NATS publish are not a distributed atomic transaction. Lost responses and crashes recover by repeating the identical database-idempotent request, retrieving the original receipt and publishing the deterministic outcome. Publish deduplication lasts only 24 hours: a later replay can store another outcome with the same ID. Future side-effect consumers must persist their own operation deduplication, especially before sending email. Never claim exactly-once end-to-end delivery.
+
+To add another worker, create a separate workspace with its own single responsibility, durable, credentials, tests and Dockerfile. Subscribe independently to the appropriate retained stream and document supported versions/idempotency. Share concrete event contracts; extract infrastructure only after real repetition. No process-level dependency on this worker is needed.
+
+CI runs typecheck, tests, the independent workspace build, real-NATS integration and a Docker build on pull requests and main pushes. It does not publish images. [Optional backend smoke test](docs/manual-smoke.md) covers a privately provisioned local commerce instance.

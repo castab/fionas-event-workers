@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.upstream/
+.env*
+!.env.example
+*.creds
+*.secret
+.test-data/
