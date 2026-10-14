@@ -204,12 +204,70 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
   assert.equal(output.includes(service.secret), false);
   assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 2);
 
+  // Live stream viewers skip history and use independent ephemeral consumers, never the worker durable.
+  const durableBeforeTail = await manager.consumers.info(INPUT_STREAM, CONSUMER);
+  const counts = new Map<string, number>();
+  for (const stream of [INPUT_STREAM, OUTPUT_STREAM]) counts.set(stream, (await manager.streams.info(stream)).state.consumer_count);
+  const viewers = ['events', 'inquiries'].map(kind => {
+    const process = spawn(globalThis.process.execPath, ['scripts/nats-tail.mjs', kind, '--non-interactive', '--limit', '1'],
+      { env: setupEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    const viewer = { kind, process, stdout: '', stderr: '', exit: new Promise<number | null>(resolve => process.once('exit', resolve)) };
+    process.stdout.on('data', chunk => { viewer.stdout += chunk.toString(); });
+    process.stderr.on('data', chunk => { viewer.stderr += chunk.toString(); });
+    t.after(() => { if (process.exitCode === null) process.kill(); });
+    return viewer;
+  });
+  for (const viewer of viewers) await waitUntil(async () => {
+    assert.equal(viewer.process.exitCode, null, viewer.stderr);
+    return viewer.stderr.includes('Watching');
+  });
+  for (const viewer of viewers) assert.equal(viewer.stdout, '', 'live tail must skip existing history');
+  const tailEvent = fixture(); tailEvent.id = randomUUID();
+  const liveOutcome = persistedEvent(tailEvent, receipt);
+  await adminJs.publish(OUTPUT_SUBJECT, bytes(liveOutcome));
+  // An additional inquiry subject proves the viewer sees the whole stream while the worker stays filtered.
+  await adminJs.publish('fionas.inquiries.tail-test.v1', bytes({ synthetic: 'live inquiry stream message' }));
+  for (const viewer of viewers) {
+    assert.equal(await viewer.exit, 0, viewer.stderr);
+    const records = viewer.stdout.trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(records.length, 1);
+    assert.equal(records[0].stream, viewer.kind === 'events' ? OUTPUT_STREAM : INPUT_STREAM);
+    assert.deepEqual(records[0].payload, viewer.kind === 'events' ? liveOutcome : { synthetic: 'live inquiry stream message' });
+    assert.equal(viewer.stdout.includes('fionas-admin-dev'), false);
+  }
+  for (const stream of [INPUT_STREAM, OUTPUT_STREAM]) assert.equal((await manager.streams.info(stream)).state.consumer_count, counts.get(stream));
+  const durableAfterTail = await manager.consumers.info(INPUT_STREAM, CONSUMER);
+  assert.deepEqual(durableAfterTail.config, durableBeforeTail.config);
+  assert.deepEqual(durableAfterTail.ack_floor, durableBeforeTail.ack_floor);
+  assert.equal(durableAfterTail.delivered.stream_seq, durableBeforeTail.delivered.stream_seq);
+  assert.equal(durableAfterTail.num_ack_pending, durableBeforeTail.num_ack_pending);
+  for (const [kind, stream] of [['events', OUTPUT_STREAM], ['inquiries', INPUT_STREAM]] as const) {
+    const replay = await exec(globalThis.process.execPath, [globalThis.process.env.npm_execpath!, '--silent', 'run', `nats:tail:${kind}`, '--', '--all', '--limit', '1', '--non-interactive'], { env: setupEnv });
+    assert.equal(JSON.parse(replay.stdout.trim()).sequence, (await manager.streams.info(stream)).state.first_seq);
+    assert.equal((await manager.streams.info(stream)).state.consumer_count, counts.get(stream));
+  }
+
   // The production-only image contains the .mjs script and its compiled dependencies.
   const dockerSetup = await exec('docker', ['run', '--rm', '--network', `container:${container}`,
     '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=fionas-admin', '-e', 'NATS_PASSWORD=fionas-admin-dev',
     '--entrypoint', 'node', 'fionas-inquiry-to-commerce:test', 'scripts/nats-setup.mjs', '--non-interactive']);
   assert.match(dockerSetup.stdout, /FIONAS_EVENTS: verified.*inquiry-to-commerce: verified/);
   assert.equal(dockerSetup.stdout.includes('fionas-admin-dev'), false);
+  const dockerTail = await exec('docker', ['run', '--rm', '--network', `container:${container}`,
+    '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=fionas-admin', '-e', 'NATS_PASSWORD=fionas-admin-dev',
+    '--entrypoint', 'node', 'fionas-inquiry-to-commerce:test', 'scripts/nats-tail.mjs', 'events', '--all', '--limit', '1', '--non-interactive']);
+  assert.equal(JSON.parse(dockerTail.stdout.trim()).stream, OUTPUT_STREAM);
+  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.consumer_count, counts.get(OUTPUT_STREAM));
+  const imageTail = `fionas-tail-image-test-${randomUUID()}`;
+  await exec('docker', ['run', '-d', '--name', imageTail, '--network', `container:${container}`,
+    '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=fionas-admin', '-e', 'NATS_PASSWORD=fionas-admin-dev',
+    '--entrypoint', 'node', 'fionas-inquiry-to-commerce:test', 'scripts/nats-tail.mjs', 'events', '--non-interactive']);
+  t.after(async () => { await exec('docker', ['rm', '-f', imageTail]); });
+  await waitUntil(async () => (await exec('docker', ['logs', imageTail])).stderr.includes('Watching'));
+  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.consumer_count, counts.get(OUTPUT_STREAM)! + 1);
+  await exec('docker', ['stop', '--time', '10', imageTail]);
+  assert.equal((await exec('docker', ['inspect', '--format', '{{.State.ExitCode}}', imageTail])).stdout.trim(), '0');
+  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.consumer_count, counts.get(OUTPUT_STREAM));
   const imageWorker = `fionas-workers-image-test-${randomUUID()}`;
   await exec('docker', ['run', '-d', '--name', imageWorker, '--network', `container:${container}`,
     '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=inquiry-to-commerce', '-e', 'NATS_PASSWORD=inquiry-to-commerce-dev',

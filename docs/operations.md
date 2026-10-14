@@ -4,6 +4,8 @@ Use a separate operator NATS context in the same account; never grant these insp
 
 ## Inspect and diagnose
 
+For live message inspection, run `npm run nats:tail:events` or `npm run nats:tail:inquiries` with separate operator credentials. Each command creates an independent temporary consumer, follows new arrivals by default, and leaves the worker's durable position unchanged. Add `-- --all` to replay retained history, or `-- --limit N` to stop after N records. Output includes customer payloads; the README describes JSON-line piping with `--non-interactive`. No viewer uses the worker's ACK permissions or changes stream configuration.
+
 ```sh
 nats stream info FIONAS_INQUIRIES
 nats stream info FIONAS_EVENTS

@@ -11,6 +11,8 @@
     "test:integration": "npm run build --workspace @fionas/inquiry-to-commerce && docker build -f workers/inquiry-to-commerce/Dockerfile -t fionas-inquiry-to-commerce:test . && node --test workers/inquiry-to-commerce/tests/integration/*.test.ts",
     "start": "npm start --workspace @fionas/inquiry-to-commerce",
     "nats:setup": "npm run build --workspace @fionas/inquiry-to-commerce && node scripts/nats-setup.mjs",
+    "nats:tail:events": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-tail.mjs events",
+    "nats:tail:inquiries": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-tail.mjs inquiries",
     "nats:up": "docker compose up -d --wait nats",
     "nats:down": "docker compose down"
   },

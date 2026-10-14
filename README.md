@@ -162,6 +162,36 @@ docker run --rm -it --entrypoint node \
 
 Enter a server reachable from the container, e.g. `nats://host.docker.internal:4222` on Docker Desktop, and accept the mounted credentials-path default. Use your platform's absolute source path for the bind mount. For automation omit `-it`, supply the NATS environment variables/mount, and append `--non-interactive`; the image needs no build step at execution time.
 
+## Watch stream messages
+
+```sh
+npm run nats:tail:events
+npm run nats:tail:inquiries
+```
+
+Both commands prompt for the NATS address and operator credentials, with the same environment defaults and hidden password entry as setup. They follow newly arriving messages in the entire selected stream. Add `-- --all` to replay retained messages first and continue watching, or `-- --limit 10` to exit after ten messages. Ctrl+C stops the viewer.
+
+Each viewer owns a temporary, no-ACK ordered consumer; it never binds to or acknowledges the worker's durable. It deletes its consumer on exit; after an abrupt termination or failed cleanup, the consumer expires after 60 seconds of inactivity. Stream configuration and stored messages remain unchanged. Use separate operator credentials with stream inspection and ephemeral-consumer create/read/pull/delete permissions; the runtime worker and public publisher identities intentionally lack these permissions. Locally use `fionas-admin` / `fionas-admin-dev` against the development broker.
+
+Output is newline-delimited JSON, one record per message: `stream`, `sequence`, `subject`, `timestamp`, `headers` (arrays of values), and `payload`. JSON payloads are parsed, other UTF-8 payloads appear as strings, and binary payloads are represented with base64 encoding. Status/error output goes to stderr. These operator views include the stored customer data.
+
+To hook another script into the output, set the operator NATS environment and use non-interactive mode; silence npm's own command banners:
+
+```sh
+npm --silent run nats:tail:events -- --non-interactive | node your-reader.mjs
+npm --silent run nats:tail:inquiries -- --non-interactive --all --limit 10
+# After a worker build, direct execution needs no npm wrapper:
+node scripts/nats-tail.mjs events --non-interactive
+```
+
+The Docker image also includes the viewer:
+
+```sh
+docker run --rm -it --entrypoint node fionas-inquiry-to-commerce:local scripts/nats-tail.mjs events
+```
+
+Use the same read-only operator credentials mounts and container-reachable address as setup. For piped Docker output, omit `-it`, supply the NATS environment/mount and append `--non-interactive`. Viewers reconnect through transient NATS disconnects; if a prolonged interruption expires their temporary consumer, restart the command (`--all` replays what is still retained). These viewers are inspection tools, not durable event processors.
+
 ## Delivery and operations
 
 The worker pulls one message at a time; consumer `max_ack_pending=1`, `max_batch=1`. The 90-second ACK deadline exceeds bounded HTTP/token calls (10 seconds each), publish (5 seconds) and confirmed input ACK (5 seconds). No business success is inferred from a network write. Only a valid `201` receipt followed by the expected stream's successful PubAck permits input ACK; duplicate PubAck is success. Token or HTTP failures never publish outcomes.

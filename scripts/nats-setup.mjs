@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { connect } from '@nats-io/transport-node';
 import { jetstreamManager } from '@nats-io/jetstream';
 
-class SetupError extends Error {}
+export class SetupError extends Error {}
 
 // No output is attached to password input: neither characters nor defaults are echoed.
 export function hiddenInput(input, output, label, signal) {
