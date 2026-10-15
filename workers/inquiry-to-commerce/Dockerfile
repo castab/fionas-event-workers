@@ -19,5 +19,6 @@ RUN npm ci --omit=dev --workspace @fionas/inquiry-to-commerce && npm cache clean
 COPY --from=build /app/workers/inquiry-to-commerce/dist ./workers/inquiry-to-commerce/dist
 COPY scripts/nats-setup.mjs ./scripts/nats-setup.mjs
 COPY scripts/nats-tail.mjs ./scripts/nats-tail.mjs
+COPY scripts/nats-retry-inquiry.mjs ./scripts/nats-retry-inquiry.mjs
 USER node
 CMD ["node", "workers/inquiry-to-commerce/dist/workers/inquiry-to-commerce/src/main.js"]

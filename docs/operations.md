@@ -1,64 +1,67 @@
 # Operating inquiry-to-commerce
 
-Use a separate operator NATS context in the same account; never grant these inspection/administration permissions to the running worker. Examples below assume the NATS CLI's configured context contains the server and operator credentials.
+Use a separate operator NATS context in the same account. Runtime keeps named-consumer INFO/NEXT/ACK/TERM and permission to publish the two explicit outcomes; it does not administer streams or consumers.
 
-## Inspect and diagnose
-
-For live message inspection, run `npm run nats:tail:events` or `npm run nats:tail:inquiries` with separate operator credentials. Each command creates an independent temporary consumer, follows new arrivals by default, and leaves the worker's durable position unchanged. Add `-- --all` to replay retained history, or `-- --limit N` to stop after N records. Output includes customer payloads; the README describes JSON-line piping with `--non-interactive`. No viewer uses the worker's ACK permissions or changes stream configuration.
+## Inspect and distinguish failure states
 
 ```sh
+nats consumer info FIONAS_INQUIRIES inquiry-to-commerce --json
 nats stream info FIONAS_INQUIRIES
 nats stream info FIONAS_EVENTS
-nats consumer info FIONAS_INQUIRIES inquiry-to-commerce
-nats consumer info FIONAS_INQUIRIES inquiry-to-commerce --json
-```
-
-Consumer info reports pending messages, ACK-pending deliveries, redeliveries, delivered sequence and ACK floor. A pending count alone does not prove all exhausted messages were handled. Track `operator_attention_required` logs with input `streamSequence`, attempt and eventId where parsing succeeded. Malformed events are identified by retained stream sequence even when no valid event ID can be extracted. Log codes distinguish credential rejection, permission denial, malformed receipts, contract rejection and transient HTTP failures; response bodies and customer details are deliberately absent.
-
-Maximum-delivery advisories are published to:
-
-```sh
 nats sub '$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.FIONAS_INQUIRIES.inquiry-to-commerce'
 ```
 
-Capture these advisories in your existing operator tooling; they include the stream sequence. Advisories are live notifications and are not retained by this repository. At the tenth failed delivery the worker also logs `exhausted:true`. A final crash instead of a completed failure may require the server's subsequent delivery-limit check before its advisory appears.
+Consumer info reports pending, ACK-pending, redelivery, delivered and ACK-floor state. Capture maximum-delivery advisories with existing operator tooling: they contain the source sequence but are live notifications, not a durable failure log. A crash can hit the delivery limit without the worker observing its final attempt. `operator_attention_required` logs include code, kind, eventId when extractable, streamSequence and attempt; exhausted processing logs `exhausted:true` then `worker_halted` / `retry_exhausted`.
 
-Inspect a specific retained source in a private terminal:
+Inspect the source by exact sequence in a private terminal:
 
 ```sh
 nats stream get FIONAS_INQUIRIES 42
+npm run nats:tail:events -- --all
 ```
 
-This command exposes customer data. Limit access and do not paste its output into public logs. Input limits retention keeps messages independent of ACKs; ACKed and failed records coexist until its own retention bounds expire. This worker does not alter those bounds. Outcomes expire after their configured finite retention. Preserve evidence/recover before input retention expires.
+The source/tail includes customer data. Diagnostics on `fionas.events.inquiry.processing-failed.v1` include only input stream/sequence/error code, optional original UUID and a deterministic stored timestamp. Malformed JSON may have no UUID. A failure diagnostic never claims successful persistence, nor proves no inquiry exists. InquiryPersisted always requires a valid commerce receipt and confirmed outcome PubAck.
 
-## Correct a problem and recover
+Failure states differ:
 
-For a transient outage or corrected permission/credential, allow the delayed redelivery to occur. No manual republish or new event ID is needed. Token cache refreshes before expiration or after a single inquiry 401. A 403 requires checking the SERVICE principal/role; changing signing keys on the worker cannot help.
+- **Terminal per-message failure:** `failure_record_published` followed by `input_terminated`. The confirmed diagnostic is retained in FIONAS_EVENTS. The original remains in FIONAS_INQUIRIES under its existing limits retention. TERM releases this delivery's pending slot; later valid inputs can proceed immediately. A lost TERM can replay the same failure identity, safely deduplicated within the window.
+- **Unresolved/retry-exhausted/systemic failure:** source remains retained and may already have committed in commerce. Credentials, permission, malformed receipts, timeouts and prolonged outages do not produce permanent-customer-failure diagnostics. Repair the environment and recover affected sequences. Exhausted sources are not automatically redelivered; absence of a failure diagnostic does not imply success.
 
-For a malformed input or a `409 IDEMPOTENCY_KEY_REUSED`, determine the contract/problem with its owning application. Do not mutate retained events, invent a receipt, change prices or generate a new event ID just to bypass idempotency. The original must stay inspectable. If the source is irreparably invalid, record its disposition through your operator process before making an explicit skip decision; the runtime will not silently discard it.
+Transient errors NAK with 10s / 30s / 2m / 5m / 15m backoff, at most ten deliveries. Observed exhaustion or systemic failure halts the worker nonzero. Use supervisor restart backoff/limits and alerting, not unlimited rapid restarts. `403` requires repairing SERVICE permissions; repeated `401` requires inspecting credentials/service state. Token refresh is retried once. Malformed success responses are contract problems, never grounds for inventing a receipt or rejecting all queued customers.
 
-Exhausted deliveries do not restart automatically. A straightforward deliberate recovery for this initial low-throughput deployment is to recreate only this worker's durable and replay all retained submissions:
+## Observed starvation and the correction
 
-1. Stop every inquiry-to-commerce process and record consumer info, failed sequences and the underlying failure.
-2. Fix configuration/code or source contract problems before replay. Ensure downstream side-effect consumers deduplicate their own operations; a replay after 24 hours can store duplicate outcome records with the same ID.
-3. With operator credentials, explicitly delete only the durable:
+The real NATS 2.14.7 regression uses the actual durable/configuration with only retry/ACK times accelerated. Malformed A followed by valid B behaved as follows under the former delayed-NAK policy:
+
+1. A occupied the only ACK-pending slot (`num_ack_pending=1`, `num_pending=1`). B could not be fetched during A's delay.
+2. Reconnecting the worker did not release A. Attempts 2–10 still delivered A.
+3. After the final ACK deadline, the server checked MaxDeliver, stopped delivering A and delivered B automatically. ACK-pending was then one for B; after B's ACK it became zero. A remained retrievable from the stream.
+
+The former one-hour poison delay could therefore hold inquiries for hours. Increasing pending capacity would only postpone that problem. The correction retains one pending slot and sequential processing, records permanent failures durably, then TERMs them. Infrastructure outages still temporarily block processing by design. If failure publication is unavailable until MaxDeliver, the retained original and operational logs/advisories are recovery evidence; no durable diagnostic can be manufactured while publication is failing.
+
+## Targeted recovery without resetting the durable
+
+1. Stop normal worker processes, record failed sequence(s), and fix the underlying issue. Restore connectivity, repair/rotate SERVICE credentials or permissions, or correct the contract implementation. Do not edit retained inputs, reprice them, or bypass idempotency misuse with fabricated identities.
+2. Load the dedicated commerce SERVICE environment and separate operator NATS credentials. Retry exactly one retained submission:
 
    ```sh
-   nats consumer rm FIONAS_INQUIRIES inquiry-to-commerce
-   npm run nats:setup -- --retention-days 30 --replicas 1
+   npm run nats:retry:inquiry -- --sequence 42
+   # Automation with NATS and commerce environment already configured:
+   npm --silent run nats:retry:inquiry -- --sequence 42 --non-interactive
    ```
 
-   Use the actual existing outcome retention/replica settings. The setup command prompts for the NATS address and separate operator credentials; for automation supply the NATS environment and add `--non-interactive`. Keep the NATS CLI's deletion confirmation prompt; this is an intentional consumer-position reset, not stream deletion. Setup creates the durable with DeliverAll and refuses outcome mismatches. Neither retained stream is deleted or recreated.
-4. Restart the worker. It replays every retained matching input. Commerce returns the original receipt for committed UUIDs; deterministic outcomes deduplicate within the publish window. Check ACK logs and consumer pending state, and verify the originally failed sequence's eventual disposition.
+   The command uses a temporary consumer starting at that sequence, verifies the exact delivered sequence/subject, and runs the same pipeline once. HTTP body/event UUID/idempotency and publication identities are preserved. It never rewinds, replaces, ACKs or modifies the primary durable. Non-success exits 1; retryable failures require another deliberate attempt after repair. Temporary state is deleted with inactivity expiry as fallback. Source payloads and secrets are never printed.
+3. Confirm `result:persisted`, the correlated InquiryPersisted and the backend inquiry/Estimate. Old failure diagnostics remain historical evidence. If original malformed/unsupported data remains invalid, recovery records the same deterministic failure and returns non-success. New/corrected business intent must go through its owning upstream workflow, not be silently rewritten here.
+4. Restart the primary worker. Before MaxDeliver, an unresolved original may redeliver after its NAK/ACK deadline, returning the same receipt/outcome safely. TERMed/exhausted originals keep their primary disposition; targeted recovery's success is recorded independently. Observe subsequent normal processing.
 
-This recovery is intentionally broad and may revisit many successful events. On larger installations use an operator-reviewed targeted consumer-position recovery appropriate to the deployed NATS version, keeping earlier unresolved messages accounted for. Do not alter DeliverAll silently in the setup script or simply reset a consumer past the failed message. An independent consumer can inspect the same source without affecting this durable.
+The command is also packaged as `node scripts/nats-retry-inquiry.mjs --sequence 42` in the worker image. Mount secrets read-only and use container-reachable addresses as for setup. It needs operator source-message/temporary-consumer access plus the dedicated commerce SERVICE credential; no staff session or token-signing key is used.
 
-Because max_ack_pending is one, a delayed unresolved delivery can block later work. This is a deliberate bounded first milestone, so alert promptly on permanent failures instead of using queue size as the sole signal. No dead-letter stream or permanent side-effect deduplication store is provided here.
+Source retention bounds recovery. If the original expired, the command refuses to process a later record and cannot restore its bytes; use established archival/business recovery. Never delete/recreate the input stream for recovery. Outcomes and diagnostics expire under FIONAS_EVENTS retention. Publication deduplication lasts 24 hours; late replay can store another record with the same ID. Every future side-effect consumer needs its own durable operation deduplication.
 
-## Process supervision
+## Provisioning and lifecycle
 
-Use a restart policy for nonzero startup failures. Read-only named consumer INFO must be allowed, and setup must precede deployment. Worker logs `nats_connected`, `durable_consumer_available`, received/persisted/published/acknowledged stages, failure classification and delayed retry scheduling. Connection statuses include kind only, excluding URLs and raw errors. No HTTP health endpoint exists.
+Stream and durable settings are unchanged; no reset/migration is required. Add runtime publish permission for `fionas.events.inquiry.processing-failed.v1`, keeping existing success-publish and named ACK/TERM rights. The existing `fionas.events.>` filter captures it. Preserve the public publisher's permissions. Operator setup continues verifying configuration and refusing mismatches.
 
-Set Docker `--stop-timeout 60` (or equivalent supervisor grace). Shutdown stops new pulls, allows up to 55 seconds for current work, then aborts/closes. Input ACK uses the confirmed ACK protocol; a lost ACK response is logged and the worker can safely replay if NATS did not receive it. A received ACK whose response was lost may already be complete, because its HTTP and outgoing publication were confirmed first.
+A delayed NAK already scheduled by the old deployment keeps its deadline across upgrade/restart. The new policy applies when that source is next delivered; it does not silently rewrite durable state. Targeted recovery can repair the selected business operation immediately, but does not cancel that old primary delay. Account for its remaining bounded delay during rollout and inspect pending state; do not reset the whole durable merely to accelerate it.
 
-The worker expects the provisioned durable to remain present. It retries pull errors at two-second intervals while the NATS client reconnects; persistent missing-resource/permission errors require operator repair. Stream and consumer administration remain operator-only.
+Use a supervisor with bounded restart backoff and alerting. SIGTERM/SIGINT stops new pulls and allows 55 seconds for current work; set termination grace to at least 60 seconds. Unfinished operations remain replayable. Lost success ACK responses may already be complete because HTTP receipt and PubAck were confirmed first. Failure TERM is sent only after its diagnostic PubAck; unconfirmed TERM can replay without false success.

@@ -13,6 +13,7 @@
     "nats:setup": "npm run build --workspace @fionas/inquiry-to-commerce && node scripts/nats-setup.mjs",
     "nats:tail:events": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-tail.mjs events",
     "nats:tail:inquiries": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-tail.mjs inquiries",
+    "nats:retry:inquiry": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-retry-inquiry.mjs",
     "nats:up": "docker compose up -d --wait nats",
     "nats:down": "docker compose down"
   },

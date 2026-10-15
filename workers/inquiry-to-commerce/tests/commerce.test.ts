@@ -39,7 +39,7 @@ for (const repeated401 of [false, true]) test(`401 replaces the token exactly on
     else json(res, ++posts === 1 || repeated401 ? 401 : 201, receipt);
   });
   const client = new CommerceClient({ baseUrl: stub.url, ...credentials });
-  if (repeated401) await assert.rejects(client.createInquiry(event.id, body, signal()), (e: ProcessingError) => e.permanent && e.status === 401);
+  if (repeated401) await assert.rejects(client.createInquiry(event.id, body, signal()), (e: ProcessingError) => e.kind === 'systemic' && e.status === 401);
   else await client.createInquiry(event.id, body, signal());
   assert.equal(auth, 2); assert.equal(posts, 2);
   const inquiries = stub.calls.filter(call => call.path === '/inquiries');
@@ -47,15 +47,16 @@ for (const repeated401 of [false, true]) test(`401 replaces the token exactly on
   assert.equal(inquiries[1]!.headers.authorization, 'Bearer test-token-2');
   assert.equal(inquiries[1]!.headers['idempotency-key'], event.id);
 });
-for (const status of [400, 403, 409, 422, 429, 500, 503]) test(`classifies HTTP ${status}, no refresh or in-process retry`, async t => {
+for (const status of [400, 403, 408, 409, 422, 429, 500, 503]) test(`classifies HTTP ${status}, no refresh or in-process retry`, async t => {
   const stub = await httpStub(t, (call, res) => json(res, call.path === '/inquiries' ? status : 200, call.path === '/inquiries' ? {} : token()));
   const client = new CommerceClient({ baseUrl: stub.url, ...credentials });
-  await assert.rejects(client.createInquiry(event.id, body, signal()), (e: ProcessingError) => e.status === status && e.permanent === (status < 429));
+  const kind = status === 400 || status === 422 ? 'permanent' : status === 403 || status === 409 ? 'systemic' : 'transient';
+  await assert.rejects(client.createInquiry(event.id, body, signal()), (e: ProcessingError) => e.status === status && e.kind === kind);
   assert.equal(stub.calls.length, 2);
 });
 test('token exchange rejection is bounded and never reaches inquiries', async t => {
   const stub = await httpStub(t, (_call, res) => json(res, 401, {}));
-  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => e.permanent && e.code === 'service_auth_rejected');
+  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => e.kind === 'systemic' && e.code === 'service_auth_rejected');
   assert.equal(stub.calls.length, 1);
 });
 for (const invalid of [
@@ -63,7 +64,7 @@ for (const invalid of [
   { ...token(), accessToken: 'invalid token' }, { ...token(), expiresIn: 1.5 }, token(1, Date.now() - 1000),
 ]) test('malformed or expired tokens never reach inquiry POST', async t => {
   const stub = await httpStub(t, (_call, res) => json(res, 200, invalid));
-  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => e.permanent);
+  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => e.kind === 'systemic');
   assert.equal(stub.calls.length, 1);
 });
 test('abort during HTTP never invents a receipt', async t => {
@@ -72,7 +73,7 @@ test('abort during HTTP never invents a receipt', async t => {
     if (call.path !== '/inquiries') json(res, 200, token());
     else controller.abort();
   });
-  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, controller.signal), (e: ProcessingError) => e.code === 'shutdown_aborted' && !e.permanent);
+  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, controller.signal), (e: ProcessingError) => e.code === 'shutdown_aborted' && e.kind === 'transient');
 });
 for (const invalid of [{}, { ...receipt, id: 'bad' }, { ...receipt, createdAt: 'yesterday' }, { ...receipt, createdAt: '2026-02-30T00:00:00Z' }]) test(`malformed 201 receipt ${JSON.stringify(invalid)}`, async t => {
   const stub = await httpStub(t, (call, res) => json(res, call.path === '/inquiries' ? 201 : 200, call.path === '/inquiries' ? invalid : token()));
@@ -94,17 +95,28 @@ test('timeout includes a stalled response body; lost response is transient', asy
     if (call.path !== '/inquiries') json(res, 200, token());
     else { res.writeHead(201, { 'Content-Type': 'application/json' }); res.write('{'); }
   });
-  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials, timeoutMs: 100 }).createInquiry(event.id, body, signal()), (e: ProcessingError) => !e.permanent && e.code === 'http_timeout');
+  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials, timeoutMs: 100 }).createInquiry(event.id, body, signal()), (e: ProcessingError) => e.kind === 'transient' && e.code === 'http_timeout');
 });
 test('connection interruption after commit cannot invent a receipt', async t => {
   const stub = await httpStub(t, (call, res) => call.path !== '/inquiries' ? json(res, 200, token()) : res.destroy());
-  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => !e.permanent && e.code === 'http_connection_failure');
+  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => e.kind === 'transient' && e.code === 'http_connection_failure');
 });
 test('redirects never forward credentials to another location', async t => {
   const stub = await httpStub(t, (call, res) => {
     if (call.path !== '/inquiries') json(res, 200, token());
     else { res.writeHead(307, { Location: '/another-endpoint' }); res.end(); }
   });
-  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()));
+  await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => e.kind === 'systemic' && e.status === 307);
   assert.equal(stub.calls.length, 2);
 });
+
+for (const [code, kind] of [['conflict', 'transient'], ['IDEMPOTENCY_KEY_REUSED', 'permanent'], ['unknown', 'systemic']] as const) {
+  test(`409 ${code} is ${kind}, without exposing response details`, async t => {
+    const stub = await httpStub(t, (call, res) => json(res, call.path === '/inquiries' ? 409 : 200,
+      call.path === '/inquiries' ? { code, message: 'sensitive-backend-detail' } : token()));
+    await assert.rejects(new CommerceClient({ baseUrl: stub.url, ...credentials }).createInquiry(event.id, body, signal()), (e: ProcessingError) => {
+      assert.equal(e.kind, kind); assert.equal(JSON.stringify(e).includes('sensitive-backend-detail'), false); return true;
+    });
+    assert.equal(stub.calls.length, 2);
+  });
+}

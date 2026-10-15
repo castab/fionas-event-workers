@@ -15,6 +15,8 @@ flowchart LR
 
 `InquirySubmitted v1` announces a priced request accepted by the web server. It does not assert commerce persistence. `InquiryPersisted v1` announces a confirmed commerce commit, including enough contact information for a future acknowledgment email worker. No email worker is implemented here.
 
+`InquiryProcessingFailed v1` is a separate minimal diagnostic for permanently unprocessable individual messages. A confirmed failure PubAck permits TERM; the original input remains retained. It never asserts successful persistence or that commerce contains no inquiry. Systemic errors stop the worker for repair instead of rejecting every queued customer submission.
+
 ## Structure and contracts
 
 ```text
@@ -35,6 +37,7 @@ There is no inbound HTTP server, database, pricing logic or event framework. NAT
 | Worker durable | `inquiry-to-commerce`, exclusively filtered to the input subject |
 | New outcome stream | `FIONAS_EVENTS`, subjects `fionas.events.>` |
 | Outcome event | `fionas.events.inquiry.persisted.v1`, type `fionas.inquiry.persisted`, schemaVersion `1` |
+| Permanent processing failure | `fionas.events.inquiry.processing-failed.v1`, type `fionas.inquiry.processing-failed`, schemaVersion `1` |
 
 The [upstream AsyncAPI](https://github.com/castab/fionas-web/blob/main/asyncapi.yaml) remains authoritative for incoming data. The worker validates structural usability, not commerce's financial or business rules. It ignores unknown additive fields and forwards a fixed projection:
 
@@ -123,6 +126,7 @@ $JS.API.CONSUMER.MSG.NEXT.FIONAS_INQUIRIES.inquiry-to-commerce
 $JS.ACK.FIONAS_INQUIRIES.inquiry-to-commerce.>
 $JS.ACK.*.*.FIONAS_INQUIRIES.inquiry-to-commerce.>
 fionas.events.inquiry.persisted.v1
+fionas.events.inquiry.processing-failed.v1
 ```
 
 The second ACK pattern supports domain/account-hash ACK subjects while staying scoped to this stream/consumer. This configuration assumes the default `$JS.API` prefix, no JetStream domain prefix, and both streams in the same account. INFO is read-only and needed for binding/reconnect; runtime has no stream INFO, CREATE, UPDATE, DELETE, general consumer access or general JetStream administration. JWT credentials and TLS are recommended in production. Provision NATS identities through your existing operator/account tooling; this repository does not generate production credentials.
@@ -194,11 +198,19 @@ Use the same read-only operator credentials mounts and container-reachable addre
 
 ## Delivery and operations
 
-The worker pulls one message at a time; consumer `max_ack_pending=1`, `max_batch=1`. The 90-second ACK deadline exceeds bounded HTTP/token calls (10 seconds each), publish (5 seconds) and confirmed input ACK (5 seconds). No business success is inferred from a network write. Only a valid `201` receipt followed by the expected stream's successful PubAck permits input ACK; duplicate PubAck is success. Token or HTTP failures never publish outcomes.
+The worker pulls one message at a time; consumer `max_ack_pending=1`, `max_batch=1`. The 90-second ACK deadline exceeds bounded HTTP/token calls (10 seconds each), publish (5 seconds) and confirmed input ACK (5 seconds). No business success is inferred from a network write. Only a valid `201` receipt followed by the expected stream's successful PubAck permits input ACK; duplicate PubAck is success. Token or HTTP failures never produce InquiryPersisted.
 
-Transient failures (`429`, `5xx`, timeouts/connections, outgoing publication) use delayed NAK: 10s, 30s, 2m, 5m, then 15m. Likely permanent failures (invalid events, credentials/permission, `400`/`409`/`422`, malformed receipts, unexpected statuses) log `operator_attention_required` and use a one-hour delay. Maximum delivery count is 10. Failures are never ACKed or TERMed; exhausted messages remain inspectable until input-stream retention removes them. With one pending slot, an unresolved message can delay later work; recover promptly. Crash/no-ACK redelivery uses the 90-second deadline. See [operations](docs/operations.md) for pending/redelivery inspection, maximum-delivery advisories and recovery.
+| Failure class | Policy |
+|---|---|
+| Permanent per-message: malformed/unsupported input, inquiry `400`/`422`, `409 IDEMPOTENCY_KEY_REUSED` | Publish deterministic InquiryProcessingFailed to FIONAS_EVENTS; require expected-stream PubAck (duplicates accepted), then TERM. No success ACK. |
+| Transient: `408`, `429`, `5xx`, timeout/connection failure, `409 conflict`, unconfirmed publication/ACK | Delayed NAK: 10s, 30s, 2m, 5m, then 15m, at most ten deliveries. |
+| Systemic: failed SERVICE exchange, inquiry `401` after its single refresh, `403`, redirects/unexpected statuses, malformed token/receipt or unknown `409` | Log operator attention and exit nonzero before pulling another inquiry. No failure event, TERM, or success ACK for the affected customer. |
 
-SIGTERM/SIGINT stop new pulls and give current work up to 55 seconds. The deadline aborts HTTP and closes NATS; unfinished inputs stay unacknowledged. Set your supervisor's termination timeout to at least 60 seconds. The client reconnects indefinitely after established-connection failures; pull errors wait two seconds before retry. Startup failures exit nonzero for supervisor retry.
+If transient retries or failure-record publication exhaust ten attempts, the worker logs `exhausted:true` and halts with `retry_exhausted`. It does not mark the submission permanently invalid. The retained original, identifiers in logs, and maximum-delivery advisories support targeted operator recovery. A final crash can exhaust attempts without the worker observing the last failure, so monitor server advisories as well. Until exhaustion, a transient outage can block later work through the one pending slot; this is deliberate fail-closed behavior during unavailable infrastructure. Crashes/unconfirmed TERM use the ACK deadline; replay republishes the same deterministic failure ID. If failure publication is unavailable, no TERM is sent.
+
+Failure identity / Nats-Msg-Id is `fionas.inquiry.processing-failed.v1:FIONAS_INQUIRIES:<stored-sequence>`. Its envelope carries optional original UUID correlation, original NATS stored timestamp, and only input stream, sequence and stable error code. No customer or financial data is copied. The stored timestamp makes retries byte-stable; it is not when the worker detected the failure. Failure records share the outcome stream's 30-day retention and 24-hour publication deduplication. See [operations](docs/operations.md) for observed starvation, targeted recovery and retention limits.
+
+SIGTERM/SIGINT stop new pulls and give current work up to 55 seconds. The deadline aborts HTTP and closes NATS; unfinished inputs stay unacknowledged. Set supervisor termination timeout to at least 60 seconds. The client reconnects after established-connection failures; transient pull errors wait two seconds before retry. NATS permission errors halt for repair. Configure supervisor restart backoff/limits and alert on `worker_halted`; repair systemic configuration or investigate exhausted attempts before restarting rather than blindly cycling queued inquiries.
 
 This is **at-least-once delivery**. HTTP commit and NATS publish are not a distributed atomic transaction. Lost responses and crashes recover by repeating the identical database-idempotent request, retrieving the original receipt and publishing the deterministic outcome. Publish deduplication lasts only 24 hours: a later replay can store another outcome with the same ID. Future side-effect consumers must persist their own operation deduplication, especially before sending email. Never claim exactly-once end-to-end delivery.
 

@@ -7,6 +7,7 @@ import { CommerceClient } from './commerce.ts';
 import { verifyInputConsumer } from './provision.ts';
 import { runLoop, Shutdown } from './runtime.ts';
 import { log } from './log.ts';
+import { failureFields, ProcessingError } from './errors.ts';
 
 async function main(): Promise<void> {
   const config = workerConfig();
@@ -18,7 +19,13 @@ async function main(): Promise<void> {
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
   const statusTask = (async () => {
-    for await (const status of nc.status()) log('info', 'nats_connection_status', { kind: status.type });
+    for await (const status of nc.status()) {
+      log('info', 'nats_connection_status', { kind: status.type });
+      if (status.type === 'error' && status.error.name === 'PermissionViolationError') {
+        log('error', 'operator_attention_required', { code: 'nats_permission_denied', action: 'repair_and_restart' });
+        process.exitCode = 1; shutdown.stop(); shutdown.operation.abort();
+      }
+    }
   })();
   const closedTask = nc.closed().then((error) => {
     if (!shutdown.stopping.signal.aborted) {
@@ -38,6 +45,7 @@ async function main(): Promise<void> {
     const commerce = new CommerceClient({ baseUrl: config.commerce.baseUrl, serviceId: config.commerce.serviceId, secret });
     await runLoop(consumer, { commerce, publish: (subject, bytes, options) => js.publish(subject, bytes, options), log }, shutdown);
   } finally {
+    shutdown.stop();
     await nc.close();
     shutdown.dispose();
     process.off('SIGINT', stop);
@@ -48,6 +56,11 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
+  if (error instanceof ProcessingError) {
+    log('error', 'worker_halted', { ...failureFields(error), action: 'repair_and_restart' });
+    process.exitCode = 1;
+    return;
+  }
   // Configuration errors are locally authored; upstream/network errors are never printed raw.
   const isConfig = error instanceof Error && /^(Missing |Invalid NATS_URL|NATS_|Choose NATS_|COMMERCE_|Supply exactly|Commerce service secret|Input consumer configuration mismatch)/.test(error.message);
   log('error', 'startup_failed', { code: isConfig ? error.message : 'check_credentials_connectivity_and_provisioned_consumer' });

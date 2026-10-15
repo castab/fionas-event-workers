@@ -3,6 +3,21 @@ import assert from 'node:assert/strict';
 import { runLoop, Shutdown } from '../src/runtime.ts';
 import { bytes, fixture, receipt } from './fixtures.ts';
 import type { JsMsg } from '@nats-io/jetstream';
+import { ProcessingError } from '../src/errors.ts';
+
+test('systemic configuration failure stops before pulling or terminally rejecting another inquiry', async () => {
+  let pulls = 0;
+  const shutdown = new Shutdown(() => {});
+  const message = { data: bytes(fixture()), timestamp: receipt.createdAt, info: { streamSequence: 1, deliveryCount: 1 },
+    term: () => assert.fail('no TERM'), ackAck: () => assert.fail('no ACK'), nak: () => assert.fail('no NAK') } as unknown as JsMsg;
+  try {
+    await assert.rejects(runLoop({ next: async () => { pulls++; return message; } }, {
+      commerce: { createInquiry: async () => { throw new ProcessingError('commerce_permission_denied', 'systemic', 403); } },
+      publish: async () => assert.fail('no customer failure event for environment failures'), log() {},
+    }, shutdown), /commerce_permission_denied/);
+    assert.equal(pulls, 1);
+  } finally { shutdown.dispose(); }
+});
 
 test('shutdown stops new pulls and lets the current operation confirm publication/ACK', async () => {
   let pulls = 0, acknowledged = false, published = false;

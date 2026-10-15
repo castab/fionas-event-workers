@@ -3,6 +3,7 @@ export const INPUT_SUBJECT = 'fionas.inquiries.submitted.v1';
 export const CONSUMER = 'inquiry-to-commerce';
 export const OUTPUT_STREAM = 'FIONAS_EVENTS';
 export const OUTPUT_SUBJECT = 'fionas.events.inquiry.persisted.v1';
+export const FAILURE_SUBJECT = 'fionas.events.inquiry.processing-failed.v1';
 
 // This is a narrow transport view, not a copy of the producer's complete schema.
 // Authority: castab/fionas-web/asyncapi.yaml.
@@ -41,6 +42,25 @@ export interface InquirySubmitted {
   data: InquiryData;
 }
 export interface InquiryReceipt { id: string; createdAt: string }
+export interface InquiryProcessingFailed {
+  schemaVersion: 1;
+  type: 'fionas.inquiry.processing-failed';
+  id: string;
+  correlationId?: string;
+  occurredAt: string;
+  source: 'fionas-event-workers';
+  data: { inputStream: 'FIONAS_INQUIRIES'; inputSequence: number; errorCode: string };
+}
+
+export function processingFailedEvent(sequence: number, storedAt: string, code: string, eventId?: string): InquiryProcessingFailed {
+  return {
+    schemaVersion: 1, type: 'fionas.inquiry.processing-failed',
+    id: `fionas.inquiry.processing-failed.v1:${INPUT_STREAM}:${sequence}`,
+    ...(eventId ? { correlationId: eventId } : {}),
+    occurredAt: storedAt, source: 'fionas-event-workers',
+    data: { inputStream: INPUT_STREAM, inputSequence: sequence, errorCode: code },
+  };
+}
 export interface InquiryPersisted {
   schemaVersion: 1;
   type: 'fionas.inquiry.persisted';

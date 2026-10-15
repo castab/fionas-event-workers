@@ -1,17 +1,30 @@
-# Optional local commerce smoke test
+# Optional full local integration smoke test
 
-This test uses real local backend persistence. It is optional; automated tests require no backend/PostgreSQL. Use private development credentials, synthetic contact details and synthetic prices only.
+Exercise `fionas-web → FIONAS_INQUIRIES → inquiry-to-commerce → fionas-commerce → FIONAS_EVENTS` with synthetic customer data and prices. Automated CI deliberately uses HTTP stubs; this procedure validates the real backend and its associated initial Estimate. No production credentials or deployment access are required.
 
-1. Start local fionas-commerce according to its README, apply its normal migrations and provision the dedicated SERVICE/role described in this repository's README. Configure this worker's `.env` with that service ID/secret and backend origin.
-2. Start the isolated local broker with `npm run nats:up`, then `node scripts/nats-local-init.ts` (or use the existing fionas-web broker and separate operator setup).
-3. Start `npm run dev --workspace @fionas/inquiry-to-commerce` and check `durable_consumer_available`.
-4. Submit a synthetic `/book` request through local fionas-web, using its own publish-only identity in the same account. The fixture in `workers/inquiry-to-commerce/tests/fixtures.ts` is an alternative synthetic payload for the NATS CLI:
+## Start and provision the local applications
 
-   ```sh
-   nats pub fionas.inquiries.submitted.v1 --jetstream --header 'Nats-Msg-Id:manual-synthetic-key' --header 'Nats-Expected-Stream:FIONAS_INQUIRIES' < synthetic-inquiry.json
-   ```
+1. Start current fionas-commerce with its PostgreSQL migrations and bootstrap administrator according to its README. Provision a new `inquiry-to-commerce` SERVICE with exactly `fionas.inquiries.create`, its own role and credential. Store its UUID/secret privately in this repository's `.env` alongside COMMERCE_BASE_URL. Never use the former fionas-web SERVICE credential, a staff session or the backend signing key for the worker.
+2. Use one local JetStream broker/account for all applications. Either start this repository's `npm run nats:up` and `node scripts/nats-local-init.ts`, or use the existing fionas-web broker with its own input-stream setup. Do not start two brokers competing for port 4222. Add this worker identity's success/failure publication and named durable permissions from `infra/nats/nats-server.conf`; keep the public fionas-web identity publish-only.
+3. Run `npm run nats:setup` as a separate NATS operator to create/verify FIONAS_EVENTS and the primary durable. Input must already exist. Normal worker runtime must not use operator credentials.
+4. Configure the local fionas-web public application per its `docs/public-inquiry-submission.md`: booking enabled, the same NATS account, its public publish-only identity, synthetic private price file, replay secret and the development Turnstile configuration. The web application calls no commerce API. Keep local secrets out of source control.
+5. Start `npm run dev --workspace @fionas/inquiry-to-commerce`. Check `durable_consumer_available`. In another terminal, run `npm run nats:tail:events` as the operator to watch new outcomes before submitting the form.
 
-   Keep one original UUID and byte-identical payload for replay. Publish only to the expected subject; the sample amounts are fictional.
-5. Confirm received → commerce_persisted → outcome_published → inquiry_acknowledged logs. With an authorized staff session, read the inquiry/canonical Estimate in commerce and verify all priced lines and service details. With operator NATS credentials, inspect the latest `FIONAS_EVENTS` message and compare its inquiryId/occurredAt to the receipt and original contact details.
-6. Stop the worker, republish the identical event UUID/body with a different synthetic submission-key header to intentionally exercise consumer replay, then restart. Confirm commerce still has one inquiry, the outgoing ID/bytes are unchanged and publication is a duplicate within 24 hours. A different event UUID represents new intent; do not use it for this replay test.
-7. Stop the worker cleanly and inspect its durable position. Clean up synthetic data through your existing development environment procedure; do not run destructive stream reset commands against a shared account.
+## Verify real persistence and canonical Estimate association
+
+1. Submit one fictional `/book` request with a distinctive synthetic note. Keep the incoming envelope UUID and source stream sequence from the worker logs; do not confuse that UUID with the public `Nats-Msg-Id` submission key. An operator can inspect that retained input with `nats stream get FIONAS_INQUIRIES <sequence>`.
+2. Confirm logs in order: `inquiry_received`, `commerce_persisted`, `outcome_published`, `inquiry_acknowledged`. Record inquiryId. Only the last stage acknowledges successful input processing.
+3. Log into commerce as an authorized local staff user with `fionas.inquiries.read` and `commerce.financial-document.read`. Use the staff UI or the existing session-authenticated `GET /staff/requests/{inquiryId}`. Do not expand the worker's permission set for this inspection.
+4. Assert the detail's `inquiry.id` equals the emitted inquiryId. Its `financial` is the current canonical INITIAL_ESTIMATE lineage: require stage `ESTIMATE`, version `1`, and `financial.id` equal to the inquiry lifecycle's document ID. Confirm `financial.inquiryId` matches and `financial.linesAuthoredBy` identifies the dedicated worker SERVICE (`principalKind: SERVICE`, `principalId` equal to COMMERCE_SERVICE_ID). Optionally cross-check with `GET /inquiries/{inquiryId}/financial-documents` and `GET /financial-documents/{financial.id}`.
+5. Compare every ordered line's descriptions, quantity, unit price, tax and currency with the original submission, preserving exact strings semantically even if commerce canonically formats decimal scale. Verify requestedService items/guest count/pricingReference and optional note through inquiry detail. Commerce derives totals and creates the initial Estimate; the worker never creates another financial document.
+6. Inspect the success outcome: subject `fionas.events.inquiry.persisted.v1`, correlationId equal to original envelope UUID, deterministic id/Nats-Msg-Id, and data.inquiryId equal to the actual backend record. occurredAt must equal that inquiry's original createdAt (including microsecond precision), with original submitted name/email/eventDate. No financial lines, ZIP, note or credentials belong in the outcome.
+
+## Verify replay and failure behavior
+
+Stop normal workers before deliberately retrying the retained input with `npm run nats:retry:inquiry -- --sequence <sequence>`, using operator NATS and the same dedicated SERVICE environment. Confirm result `persisted`, the same inquiry/Estimate IDs and original creation time, and duplicate PubAck inside 24 hours. The primary durable must not be reset. A late replay may store another outcome with the same ID; downstream operations must deduplicate independently. Restart the worker afterward.
+
+On an isolated development instance, revoke the SERVICE permission temporarily and submit two synthetic valid inquiries. The first `403` must halt the worker with operator attention, without InquiryProcessingFailed, TERM, or a false InquiryPersisted. Restore the permission, retry the affected source sequence if needed, then restart. Both inquiries must eventually persist using their original UUIDs; no customer payloads or credentials should appear in runtime logs.
+
+To exercise poison handling, use the synthetic unsupported-version publication in the real-NATS integration test as the model. A poison record followed by a valid form submission must produce a minimal InquiryProcessingFailed for the first input, followed by normal persistence for the valid one. The original poison source remains inspectable; its failure diagnostic contains only stream/sequence/code, optional UUID and deterministic timestamp. No success is fabricated for it. See `operations.md` for recovery and the limitations of expired source retention.
+
+Stop processes cleanly and retain synthetic verification evidence privately. Remove local synthetic data through the applications' established development procedures; do not reset shared stream/durable state as ordinary cleanup.

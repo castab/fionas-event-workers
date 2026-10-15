@@ -14,7 +14,7 @@ function validDate(value: string): boolean {
     Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
 }
 function requireShape(condition: unknown): asserts condition {
-  if (!condition) throw new ProcessingError('invalid_inquiry_submitted', true);
+  if (!condition) throw new ProcessingError('invalid_inquiry_submitted', 'permanent');
 }
 function requiredText(object: Record<string, unknown>, key: string): string {
   const value = object[key];
@@ -30,10 +30,10 @@ function optionalText(object: Record<string, unknown>, key: string): string | un
 export function parseSubmitted(bytes: Uint8Array): InquirySubmitted {
   let event: unknown;
   try { event = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
-  catch { throw new ProcessingError('invalid_event_json', true); }
+  catch { throw new ProcessingError('invalid_event_json', 'permanent'); }
   requireShape(isObject(event));
   if (event.schemaVersion !== 1 || event.type !== 'fionas.inquiry.submitted') {
-    throw new ProcessingError('unsupported_event_type_or_version', true);
+    throw new ProcessingError('unsupported_event_type_or_version', 'permanent');
   }
   requireShape(isUuid(event.id) && isTimestamp(event.occurredAt) && event.source === 'fionas-web');
   const data = event.data;

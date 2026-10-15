@@ -108,8 +108,8 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
   const deps = { commerce, publish: (subject: string, data: Uint8Array, options: any) => js.publish(subject, data, options),
     log: (_level: unknown, kind: string) => { logs.push(kind); } };
   // Accelerate deliberate NAK delays only for the test; all ACKs still go to the real server.
-  const fastDelivery = (message: JsMsg) => ({ data: message.data, info: message.info,
-    ackAck: (options?: { timeout: number }) => message.ackAck(options), nak: () => message.nak(50) });
+  const fastDelivery = (message: JsMsg) => ({ data: message.data, timestamp: message.timestamp, info: message.info,
+    ackAck: (options?: { timeout: number }) => message.ackAck(options), nak: () => message.nak(50), term: (reason?: string) => message.term(reason) });
   const first = await consumer.next({ expires: 1000 }); assert.ok(first);
   assert.equal(first.subject, INPUT_SUBJECT);
   await processDelivery(fastDelivery(first), deps, new AbortController().signal);
@@ -252,6 +252,8 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
     '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=fionas-admin', '-e', 'NATS_PASSWORD=fionas-admin-dev',
     '--entrypoint', 'node', 'fionas-inquiry-to-commerce:test', 'scripts/nats-setup.mjs', '--non-interactive']);
   assert.match(dockerSetup.stdout, /FIONAS_EVENTS: verified.*inquiry-to-commerce: verified/);
+  assert.match((await exec('docker', ['run', '--rm', '--entrypoint', 'node', 'fionas-inquiry-to-commerce:test',
+    'scripts/nats-retry-inquiry.mjs', '--help'])).stdout, /exactly one retained input/);
   assert.equal(dockerSetup.stdout.includes('fionas-admin-dev'), false);
   const dockerTail = await exec('docker', ['run', '--rm', '--network', `container:${container}`,
     '-e', 'NATS_URL=nats://127.0.0.1:4222', '-e', 'NATS_USER=fionas-admin', '-e', 'NATS_PASSWORD=fionas-admin-dev',
