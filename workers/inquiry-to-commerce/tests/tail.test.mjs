@@ -15,7 +15,7 @@ test('tail maps only the two supported streams and defaults to new messages', ()
 });
 test('tail emits complete JSON-line records with parsed payload and multi-value headers', () => {
   const message = { data: new TextEncoder().encode('{"schemaVersion":1,"note":"line\\nnext"}'), seq: 7,
-    subject: 'fionas.events.inquiry.persisted.v1', timestamp: '2026-10-14T18:30:00Z',
+    subject: 'fionas.events.example.v1', timestamp: '2026-10-14T18:30:00Z',
     headers: { keys: () => ['Example'], values: () => ['one', 'two'] } };
   const record = messageRecord('FIONAS_EVENTS', message);
   assert.deepEqual(record.payload, { schemaVersion: 1, note: 'line\nnext' });

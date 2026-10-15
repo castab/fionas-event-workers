@@ -7,25 +7,39 @@ flowchart LR
   Web[fionas-web: form and pricing] --> In[(FIONAS_INQUIRIES)]
   In --> Worker[inquiry-to-commerce durable pull worker]
   Worker -->|SERVICE token, idempotent POST /inquiries| Commerce[fionas-commerce]
-  Commerce -->|committed receipt| Worker
-  Worker -->|confirmed PubAck| Out[(FIONAS_EVENTS)]
-  Out --> Future[Future independent workers]
-  Worker -->|ACK only after PubAck| In
+  Commerce -->|"atomic: inquiry + Estimate + outbox event"| DB[(PostgreSQL)]
+  Commerce -->|"201 committed receipt"| Worker
+  Worker -->|"ACK after valid receipt"| In
+  DB -.->|"commerce outbox publisher, asynchronous"| Out[(FIONAS_EVENTS)]
+  Out --> Future[Downstream consumers]
+  Worker -.->|"InquiryProcessingFailed, only before TERM"| Out
 ```
 
-`InquirySubmitted v1` announces a priced request accepted by the web server. It does not assert commerce persistence. `InquiryPersisted v1` announces a confirmed commerce commit, including enough contact information for a future acknowledgment email worker. No email worker is implemented here.
+`InquirySubmitted v1` announces a priced request accepted by the web server. It does not assert commerce persistence.
 
-`InquiryProcessingFailed v1` is a separate minimal diagnostic for permanently unprocessable individual messages. A confirmed failure PubAck permits TERM; the original input remains retained. It never asserts successful persistence or that commerce contains no inquiry. Systemic errors stop the worker for repair instead of rejecting every queued customer submission.
+### Who owns what
+
+| Component | Responsibility |
+|---|---|
+| `fionas-web` | Produces `InquirySubmitted` after accepting and pricing a public inquiry. |
+| `inquiry-to-commerce` (this repository) | Reliably transports that request to the commerce API and records, as `InquiryProcessingFailed`, the failures it owns. |
+| `fionas-commerce` | Atomically commits the business facts (customer, inquiry, initial Estimate) **and** the success event in its transactional outbox, in one PostgreSQL transaction. Owns the success-event contract (a future commerce-owned `InquiryPersisted`). |
+| Commerce outbox publisher | Asynchronously publishes committed business events from the outbox to `FIONAS_EVENTS`. |
+| Downstream consumers | Independently process those events, each with its own durable idempotency. |
+
+**The worker's input ACK no longer depends on any success-event PubAck, and the worker publishes no success event.** Once commerce returns a valid `201` receipt, the worker confirms the original JetStream ACK; it does not wait for, poll or verify the outbox publication. NATS remains part of the failure-disposition workflow: `InquiryProcessingFailed v1` is a minimal diagnostic for permanently unprocessable individual messages. A confirmed failure PubAck permits TERM; the original input remains retained. It describes a failure to process the incoming message, not a committed change to commerce state, and never asserts successful persistence or that commerce contains no inquiry. Systemic errors stop the worker for repair instead of rejecting every queued customer submission.
+
+> **Cross-repository dependency.** This behavior relies on a strengthened commerce guarantee: *a valid HTTP 201 means the inquiry, initial Estimate and authoritative success outbox event committed atomically, and an idempotent replay returns the original receipt without appending another outbox event.* The worker cannot verify this. Do **not** deploy this version against a commerce whose `POST /inquiries` commits without that outbox write; the success event would be lost. See [Deployment cutover](#deployment-cutover).
 
 ## Structure and contracts
 
 ```text
 workers/inquiry-to-commerce/  source, tests, independent build and Dockerfile
-packages/events/             narrow incoming types and owned outcome construction
+packages/events/             narrow incoming types and the owned InquiryProcessingFailed construction
 scripts/                     explicit operator setup and isolated local initialization
 infra/nats/                  local-only least-privilege NATS configuration
-docs/                        contract audit, operations and optional backend smoke test
-asyncapi.yaml                owned InquiryPersisted v1 contract
+docs/                        contract audit, operations and coordinated full-system smoke test
+asyncapi.yaml                owned InquiryProcessingFailed v1 contract
 ```
 
 There is no inbound HTTP server, database, pricing logic or event framework. NATS uses `@nats-io/jetstream` and `@nats-io/transport-node` 3.4.0; HTTP uses native fetch. Dependencies are pinned in `package-lock.json`.
@@ -35,24 +49,22 @@ There is no inbound HTTP server, database, pricing logic or event framework. NAT
 | Existing input stream | `FIONAS_INQUIRIES`, subjects `fionas.inquiries.>` |
 | Input event | `fionas.inquiries.submitted.v1`, type `fionas.inquiry.submitted`, schemaVersion `1` |
 | Worker durable | `inquiry-to-commerce`, exclusively filtered to the input subject |
-| New outcome stream | `FIONAS_EVENTS`, subjects `fionas.events.>` |
-| Outcome event | `fionas.events.inquiry.persisted.v1`, type `fionas.inquiry.persisted`, schemaVersion `1` |
-| Permanent processing failure | `fionas.events.inquiry.processing-failed.v1`, type `fionas.inquiry.processing-failed`, schemaVersion `1` |
+| Shared event stream | `FIONAS_EVENTS`, subjects `fionas.events.>`. Holds this worker's failure diagnostics and the success events published by commerce's outbox publisher |
+| Permanent processing failure (the only event this worker publishes) | `fionas.events.inquiry.processing-failed.v1`, type `fionas.inquiry.processing-failed`, schemaVersion `1` |
 
 The [upstream AsyncAPI](https://github.com/castab/fionas-web/blob/main/asyncapi.yaml) remains authoritative for incoming data. The worker validates structural usability, not commerce's financial or business rules. It ignores unknown additive fields and forwards a fixed projection:
 
-| Incoming property | HTTP / outcome mapping |
+| Incoming property | HTTP / diagnostic mapping |
 |---|---|
-| `id` | HTTP `Idempotency-Key`; outcome `correlationId` |
+| `id` | HTTP `Idempotency-Key`, unchanged on every retry; failure-diagnostic `correlationId` |
 | `data.name`, `email`, `zipCode`, `eventDate`, `eventType` | Same fields in HTTP body, unchanged |
 | `data.message` | HTTP `message` only when present |
 | `data.requestedService` | `guestCount`, optional `guestCountIsMinimum`, ordered `items` with label/group/key, optional `pricingReference` |
 | `data.lines` | Complete ordered lines: description, optional subDescription/quantity, unitPrice, taxAmount, currency; exact strings unchanged |
 | Envelope and `data.priceRevision` | Not included in HTTP body; no separate revision or totals invented |
-| Commerce `201 {id, createdAt}` | Outcome `data.inquiryId`, `occurredAt`, retaining microsecond timestamp text |
-| Original name/email/eventDate | Outcome `data.customer.{name,email}` and `data.eventDate` |
+| Commerce `201 {id, createdAt}` | Validated (UUID `id`, timestamp `createdAt`) and logged by identifier only; a successful status without a valid receipt is a systemic contract failure and is never ACKed |
 
-Outcome identity and `Nats-Msg-Id` are `fionas.inquiry.persisted.v1:<incoming-UUID>`. Serialization uses fixed field order. A repeat with the same input and receipt produces identical bytes. Outcome events contain no lines, ZIP, note, tokens or browser replay envelopes. See [asyncapi.yaml](asyncapi.yaml) and the [contract audit](docs/contract-audit.md).
+The HTTP request projection is deterministic and fixed-order, so a repeat with the same input produces an identical body and key. The only event this worker publishes is `InquiryProcessingFailed`, whose identity and `Nats-Msg-Id` are `fionas.inquiry.processing-failed.v1:FIONAS_INQUIRIES:<stored-sequence>`. It contains no lines, ZIP, note, contact details, tokens or browser replay envelopes. See [asyncapi.yaml](asyncapi.yaml) and the [contract audit](docs/contract-audit.md).
 
 ## Local development
 
@@ -66,7 +78,7 @@ npm run build --workspace @fionas/inquiry-to-commerce
 npm run test:integration
 ```
 
-Ordinary tests use pure fixtures and local HTTP stubs, including interactive prompt/password tests. Integration tests build the production worker image, automatically create a disposable real NATS 2.14.7 container/account on a random localhost port, check provisioning, least-privilege processing, lost HTTP/PubAck recovery, restart/redelivery and independent consumers, and exercise the packaged setup script and normal worker startup. They then remove only their own containers and anonymous volume. No production secrets, backend or PostgreSQL are needed. Docker must be running; integration does not silently skip.
+Ordinary tests use pure fixtures and local HTTP stubs, including interactive prompt/password tests. Integration tests build the production worker image, automatically create a disposable real NATS 2.14.7 container/account on a random localhost port, check provisioning, least-privilege processing (including that the worker identity cannot publish a success event), lost HTTP-response and lost input-ACK recovery with idempotent replay, restart/redelivery, failure-diagnostic publication and targeted recovery, and exercise the packaged setup script and normal worker startup. Their HTTP backend is a synthetic stub that *models* the atomic commerce receipt contract (one simulated outbox append per idempotency key, none on replay); that is a test assumption, not proof of the real PostgreSQL outbox. Where a test needs a commerce-produced event on `FIONAS_EVENTS`, a separate operator identity publishes an opaque synthetic message; the worker never does. They then remove only their own containers and anonymous volume. No production secrets, backend or PostgreSQL are needed. Docker must be running; integration does not silently skip.
 
 For an isolated development broker:
 
@@ -127,11 +139,10 @@ $JS.API.CONSUMER.INFO.FIONAS_INQUIRIES.inquiry-to-commerce
 $JS.API.CONSUMER.MSG.NEXT.FIONAS_INQUIRIES.inquiry-to-commerce
 $JS.ACK.FIONAS_INQUIRIES.inquiry-to-commerce.>
 $JS.ACK.*.*.FIONAS_INQUIRIES.inquiry-to-commerce.>
-fionas.events.inquiry.persisted.v1
 fionas.events.inquiry.processing-failed.v1
 ```
 
-The second ACK pattern supports domain/account-hash ACK subjects while staying scoped to this stream/consumer. This configuration assumes the default `$JS.API` prefix, no JetStream domain prefix, and both streams in the same account. INFO is read-only and needed for binding/reconnect; runtime has no stream INFO, CREATE, UPDATE, DELETE, general consumer access or general JetStream administration. JWT credentials and TLS are recommended in production. Provision NATS identities through your existing operator/account tooling; this repository does not generate production credentials.
+Publication is limited to the failure-diagnostic subject. The runtime identity must **not** be granted `fionas.events.inquiry.persisted.v1` or any other success subject: success events are published by commerce's outbox publisher under its own identity. When upgrading from the previous release, remove the former `fionas.events.inquiry.persisted.v1` publish permission as part of the cutover below. The second ACK pattern supports domain/account-hash ACK subjects while staying scoped to this stream/consumer. This configuration assumes the default `$JS.API` prefix, no JetStream domain prefix, and both streams in the same account. INFO is read-only and needed for binding/reconnect; runtime has no stream INFO, CREATE, UPDATE, DELETE, general consumer access or general JetStream administration. JWT credentials and TLS are recommended in production. Provision NATS identities through your existing operator/account tooling; this repository does not generate production credentials.
 
 ## Environment and Docker
 
@@ -201,12 +212,12 @@ Use the same read-only operator credentials mounts and container-reachable addre
 
 ## Delivery and operations
 
-The worker pulls one message at a time; consumer `max_ack_pending=1`, `max_batch=1`. The 90-second ACK deadline exceeds bounded HTTP/token calls (10 seconds each), publish (5 seconds) and confirmed input ACK (5 seconds). No business success is inferred from a network write. Only a valid `201` receipt followed by the expected stream's successful PubAck permits input ACK; duplicate PubAck is success. Token or HTTP failures never produce InquiryPersisted.
+The worker pulls one message at a time; consumer `max_ack_pending=1`, `max_batch=1`. The 90-second ACK deadline exceeds bounded HTTP/token calls (10 seconds each), failure-diagnostic publish (5 seconds) and confirmed input ACK (5 seconds). No business success is inferred from a network write. Only a valid `201` receipt permits the input ACK, and the ACK must itself be confirmed; there is no success-event publication or PubAck in this path. A successful ACK confirms that commerce acknowledged the original operation, not that commerce's outbox publisher has already delivered its event to NATS.
 
 | Failure class | Policy |
 |---|---|
 | Permanent per-message: malformed/unsupported input, inquiry `400`/`422`, `409 IDEMPOTENCY_KEY_REUSED` | Publish deterministic InquiryProcessingFailed to FIONAS_EVENTS; require expected-stream PubAck (duplicates accepted), then TERM. No success ACK. |
-| Transient: `408`, `429`, `5xx`, timeout/connection failure, `409 conflict`, unconfirmed publication/ACK | Delayed NAK: 10s, 30s, 2m, 5m, then 15m, at most ten deliveries. |
+| Transient: `408`, `429`, `5xx`, timeout/connection failure (including a response lost after commerce committed: the outcome is unknown, so the identical request and key are repeated), `409 conflict`, unconfirmed failure publication/input ACK | Delayed NAK: 10s, 30s, 2m, 5m, then 15m, at most ten deliveries. |
 | Systemic: failed SERVICE exchange, inquiry `401` after its single refresh, `403`, redirects/unexpected statuses, malformed token/receipt or unknown `409` | Log operator attention and exit nonzero before pulling another inquiry. No failure event, TERM, or success ACK for the affected customer. |
 
 If transient retries or failure-record publication exhaust ten attempts, the worker logs `exhausted:true` and halts with `retry_exhausted`. It does not mark the submission permanently invalid. The retained original, identifiers in logs, and maximum-delivery advisories support targeted operator recovery. A final crash can exhaust attempts without the worker observing the last failure, so monitor server advisories as well. Until exhaustion, a transient outage can block later work through the one pending slot; this is deliberate fail-closed behavior during unavailable infrastructure. Crashes/unconfirmed TERM use the ACK deadline; replay republishes the same deterministic failure ID. If failure publication is unavailable, no TERM is sent.
@@ -215,7 +226,23 @@ Failure identity / Nats-Msg-Id is `fionas.inquiry.processing-failed.v1:FIONAS_IN
 
 SIGTERM/SIGINT stop new pulls and give current work up to 55 seconds. The deadline aborts HTTP and closes NATS; unfinished inputs stay unacknowledged. Set supervisor termination timeout to at least 60 seconds. The client reconnects after established-connection failures; transient pull errors wait two seconds before retry. NATS permission errors halt for repair. Configure supervisor restart backoff/limits and alert on `worker_halted`; repair systemic configuration or investigate exhausted attempts before restarting rather than blindly cycling queued inquiries.
 
-This is **at-least-once delivery**. HTTP commit and NATS publish are not a distributed atomic transaction. Lost responses and crashes recover by repeating the identical database-idempotent request, retrieving the original receipt and publishing the deterministic outcome. Publish deduplication lasts only 24 hours: a later replay can store another outcome with the same ID. Future side-effect consumers must persist their own operation deduplication, especially before sending email. Never claim exactly-once end-to-end delivery.
+This is **at-least-once delivery**. The input ACK and the commerce HTTP commit are not a distributed atomic transaction: a lost HTTP response or input ACK, or a crash between them, recovers by repeating the identical database-idempotent request (same event UUID as `Idempotency-Key`, same body), which must return the original receipt and must not append another outbox event. The HTTP/NATS atomicity gap that previously sat between commit and success-event publication has moved into commerce, where the inquiry and its outbox event commit in one database transaction and the outbox publisher delivers at least once. Failure-diagnostic publication still has the NATS-side limitation that deduplication lasts only 24 hours: a later replay can store another diagnostic with the same ID. Downstream consumers, especially before sending email, must persist their own operation deduplication on the event id. Never claim exactly-once end-to-end delivery.
+
+## Deployment cutover
+
+This worker change was developed ahead of its commerce counterpart. **Do not deploy it, or merge it into an automatically deployed branch, until commerce's outbox integration is live.** Required order:
+
+1. Release the shared transactional outbox infrastructure (`commerce-runtime`).
+2. Integrate it into `fionas-commerce`.
+3. Add commerce-owned `InquiryPersisted` outbox writes in the same transaction as the inquiry and initial Estimate.
+4. Configure the commerce NATS outbox publisher (its own identity, publishing to `FIONAS_EVENTS`).
+5. Verify successful outbox-to-NATS publication.
+6. Deploy this revised worker as a coordinated cutover and remove the worker identity's `fionas.events.inquiry.persisted.v1` publish permission.
+7. Confirm that only commerce publishes the authoritative success event.
+
+Until then the previously deployed worker keeps its behavior; there is no permanent legacy mode or implicit fallback. If an interim dual-version deployment becomes necessary, document it explicitly instead of adding a fallback. `FIONAS_INQUIRIES`, `FIONAS_EVENTS` and the `inquiry-to-commerce` durable are unchanged; do not delete, recreate, rewind or reset them.
+
+Retained inputs created before cutover are replayed safely: an idempotent replay of an already-committed inquiry returns its existing receipt and must not manufacture a new business event. If older records need a success-event backfill, that is a separate, deliberate recovery procedure owned by commerce, not something this worker or its retry tool does.
 
 To add another worker, create a separate workspace with its own single responsibility, durable, credentials, tests and Dockerfile. Subscribe independently to the appropriate retained stream and document supported versions/idempotency. Share concrete event contracts; extract infrastructure only after real repetition. No process-level dependency on this worker is needed.
 

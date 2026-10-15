@@ -8,7 +8,7 @@ import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { connect } from '@nats-io/transport-node';
 import { AckPolicy, DeliverPolicy, jetstream, jetstreamManager, RetentionPolicy, StorageType } from '@nats-io/jetstream';
-import { INPUT_STREAM, INPUT_SUBJECT, OUTPUT_STREAM, OUTPUT_SUBJECT, CONSUMER, persistedEvent } from '../../../../packages/events/src/index.ts';
+import { INPUT_STREAM, INPUT_SUBJECT, OUTPUT_STREAM, CONSUMER } from '../../../../packages/events/src/index.ts';
 import { provision, verifyInputConsumer } from '../../src/provision.ts';
 import { processDelivery } from '../../src/process.ts';
 import { CommerceClient } from '../../src/commerce.ts';
@@ -18,6 +18,10 @@ import type { NatsConnection } from '@nats-io/transport-node';
 import type { JsMsg } from '@nats-io/jetstream';
 const exec = promisify(execFile);
 const image = 'nats:2.14.7-alpine';
+// Commerce owns the real success event and its subject/schema, which are intentionally not defined here.
+// This opaque subject only lets a separate operator identity stand in for the commerce outbox publisher.
+const SIMULATED_COMMERCE_SUBJECT = 'fionas.events.test.simulated-commerce.v1';
+const simulatedCommerceEvent = (id: string) => ({ synthetic: true, simulatedBy: 'test-operator', id });
 
 async function waitUntil(check: () => Promise<boolean>, timeout = 10_000): Promise<void> {
   const end = Date.now() + timeout;
@@ -84,14 +88,19 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
   assert.equal((await manager.streams.info(OUTPUT_STREAM)).config.max_age, 30 * 86_400_000_000_000);
   verifyInputConsumer((await manager.consumers.info(INPUT_STREAM, CONSUMER)).config);
 
-  let committed = false, loseResponse = true;
-  const requests: Array<{ key: string | string[] | undefined; body: string }> = [];
+  // TEST ASSUMPTION, not proof of the PostgreSQL outbox: this stub models the strengthened commerce contract in
+  // which a 201 means inquiry, Estimate and success-outbox event committed atomically, and an idempotent replay
+  // returns the original receipt without appending another outbox event.
+  const committedReceipts = new Map<string, typeof receipt>();
+  let outboxAppends = 0, loseResponse = true;
+  const requests: Array<{ key: string; body: string }> = [];
   const stub = await httpStub(t, (call, res) => {
     if (call.path === '/auth/service/token') { json(res, 200, token()); return; }
-    requests.push({ key: call.headers['idempotency-key'], body: call.body });
-    committed = true;
+    const key = String(call.headers['idempotency-key']);
+    requests.push({ key, body: call.body });
+    if (!committedReceipts.has(key)) { committedReceipts.set(key, receipt); outboxAppends++; }
     if (loseResponse) { loseResponse = false; res.destroy(); }
-    else json(res, 201, receipt);
+    else json(res, 201, committedReceipts.get(key));
   });
   const service = { serviceId: '11111111-1111-4111-8111-111111111111', secret: 'synthetic-secret' };
   const commerce = new CommerceClient({ baseUrl: stub.url, ...service });
@@ -105,50 +114,63 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
   await adminJs.publish('fionas.inquiries.unsupported.v2', bytes({ unrelated: true }));
   await adminJs.publish(INPUT_SUBJECT, bytes(event), { msgID: 'public-submission-key-distinct-from-event-id' });
   const logs: string[] = [];
-  const deps = { commerce, publish: (subject: string, data: Uint8Array, options: any) => js.publish(subject, data, options),
+  let publications = 0;
+  // The success path has no publication step; any call here would be a regression.
+  const deps = { commerce, publish: async (): Promise<never> => { publications++; throw new Error('success path must not publish'); },
     log: (_level: unknown, kind: string) => { logs.push(kind); } };
   // Accelerate deliberate NAK delays only for the test; all ACKs still go to the real server.
   const fastDelivery = (message: JsMsg) => ({ data: message.data, timestamp: message.timestamp, info: message.info,
     ackAck: (options?: { timeout: number }) => message.ackAck(options), nak: () => message.nak(50), term: (reason?: string) => message.term(reason) });
   const first = await consumer.next({ expires: 1000 }); assert.ok(first);
   assert.equal(first.subject, INPUT_SUBJECT);
-  await processDelivery(fastDelivery(first), deps, new AbortController().signal);
-  assert.equal(committed, true);
+  assert.equal(await processDelivery(fastDelivery(first), deps, new AbortController().signal), 'retry');
+  assert.equal(outboxAppends, 1, 'the simulated commit happened before the response was lost');
   assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 0);
   assert.equal((await manager.consumers.info(INPUT_STREAM, CONSUMER)).num_ack_pending, 1);
   assert.equal(logs.includes('inquiry_acknowledged'), false);
 
-  // HTTP replay recovers committed receipt, but a failure before outgoing PubAck must not ACK.
+  // Identical replay recovers the committed receipt; the valid receipt alone permits the confirmed input ACK.
   const second = await consumer.next({ expires: 1000 }); assert.ok(second);
   assert.ok(second.info.deliveryCount >= 2);
-  await processDelivery(fastDelivery(second), { ...deps, publish: async () => { throw new Error('outgoing unavailable'); } }, new AbortController().signal);
-  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 0);
-  assert.equal((await manager.consumers.info(INPUT_STREAM, CONSUMER)).num_ack_pending, 1);
+  assert.equal(await processDelivery(fastDelivery(second), deps, new AbortController().signal), 'persisted');
+  assert.equal(outboxAppends, 1, 'idempotent replay appends no further outbox event');
+  assert.equal((await manager.consumers.info(INPUT_STREAM, CONSUMER)).num_ack_pending, 0);
+  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 0, 'the worker publishes no success event');
+  assert.equal(requests.length, 2);
+  for (const request of requests) { assert.equal(request.key, event.id); assert.equal(request.body, requests[0]!.body); }
 
-  // Publication reaches NATS; simulate its PubAck being lost before the pipeline receives it.
+  // Input ACK request lost after the receipt: the input is redelivered and the identical request is replayed.
+  const lostAckEvent = fixture(); lostAckEvent.id = randomUUID();
+  await adminJs.publish(INPUT_SUBJECT, bytes(lostAckEvent));
   const third = await consumer.next({ expires: 1000 }); assert.ok(third);
-  await processDelivery(fastDelivery(third), { ...deps, publish: async (subject, data, options) => {
-    await js.publish(subject, data, options); throw new Error('PubAck lost');
-  } }, new AbortController().signal);
-  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 1);
+  assert.equal(await processDelivery({ ...fastDelivery(third), ackAck: async () => { throw new Error('ACK request lost'); } },
+    deps, new AbortController().signal), 'retry');
   assert.equal((await manager.consumers.info(INPUT_STREAM, CONSUMER)).num_ack_pending, 1);
   const fourth = await consumer.next({ expires: 1000 }); assert.ok(fourth);
-  let duplicate = false;
-  await processDelivery(fastDelivery(fourth), { ...deps, publish: async (subject, data, options) => {
-    const ack = await js.publish(subject, data, options); duplicate = ack.duplicate; return ack;
-  } }, new AbortController().signal);
-  assert.equal(duplicate, true);
+  assert.ok(fourth.info.deliveryCount >= 2);
+  assert.equal(await processDelivery(fastDelivery(fourth), deps, new AbortController().signal), 'persisted');
   assert.equal((await manager.consumers.info(INPUT_STREAM, CONSUMER)).num_ack_pending, 0);
-  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 1);
-  assert.ok(requests.length >= 4);
-  for (const request of requests) { assert.equal(request.key, event.id); assert.equal(request.body, requests[0]!.body); }
-  const stored = await manager.streams.getMessage(OUTPUT_STREAM, { seq: 1 }); assert.ok(stored);
-  assert.equal(stored.string(), JSON.stringify(persistedEvent(event, receipt)));
-  assert.equal(stored.header.get('Nats-Msg-Id'), persistedEvent(event, receipt).id);
+  const replayed = requests.filter(request => request.key === lostAckEvent.id);
+  assert.equal(replayed.length, 2); assert.equal(replayed[0]!.body, replayed[1]!.body);
+  assert.equal(outboxAppends, 2, 'one simulated outbox append per distinct idempotency key');
+  assert.equal(publications, 0);
+  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 0);
 
-  // Independent future side-effect consumers each observe the same retained outcome.
+  // Least privilege: the runtime identity may publish only its failure diagnostics, never a success event.
+  const denied = await connect({ servers: url, user: 'inquiry-to-commerce', pass: 'inquiry-to-commerce-dev', reconnect: false });
+  t.after(() => denied.close());
+  for (const subject of ['fionas.events.inquiry.persisted.v1', SIMULATED_COMMERCE_SUBJECT]) {
+    await assert.rejects(jetstream(denied, { timeout: 1000 }).publish(subject, bytes({ forged: true })));
+  }
+  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 0);
+
+  // A separate operator identity stands in for the commerce outbox publisher; independent consumers observe it.
+  const simulated = simulatedCommerceEvent(randomUUID());
+  await adminJs.publish(SIMULATED_COMMERCE_SUBJECT, bytes(simulated), { msgID: simulated.id });
+  const stored = await manager.streams.getMessage(OUTPUT_STREAM, { seq: 1 }); assert.ok(stored);
+  assert.equal(stored.subject, SIMULATED_COMMERCE_SUBJECT);
   for (const name of ['future-email', 'future-analytics']) {
-    await manager.consumers.add(OUTPUT_STREAM, { durable_name: name, filter_subject: OUTPUT_SUBJECT, ack_policy: AckPolicy.Explicit });
+    await manager.consumers.add(OUTPUT_STREAM, { durable_name: name, filter_subject: SIMULATED_COMMERCE_SUBJECT, ack_policy: AckPolicy.Explicit });
     const observer = await adminJs.consumers.get(OUTPUT_STREAM, name);
     const outcome = await observer.next({ expires: 1000 }); assert.ok(outcome);
     assert.equal(outcome.string(), stored.string()); await outcome.ackAck();
@@ -163,7 +185,7 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
 
   // Actual unacknowledged delivery survives client interruption (accelerated ack_wait in test consumer).
   await manager.consumers.add(INPUT_STREAM, { durable_name: 'interrupted-test', filter_subject: INPUT_SUBJECT,
-    ack_policy: AckPolicy.Explicit, deliver_policy: DeliverPolicy.All, ack_wait: 300_000_000 });
+    ack_policy: AckPolicy.Explicit, deliver_policy: DeliverPolicy.Last, ack_wait: 300_000_000 });
   const interruptedNc = await connect({ servers: url, user: 'fionas-admin', pass: 'fionas-admin-dev' });
   const interrupted = await jetstream(interruptedNc).consumers.get(INPUT_STREAM, 'interrupted-test');
   const unfinished = await interrupted.next({ expires: 1000 }); assert.ok(unfinished);
@@ -202,7 +224,7 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
   if (process.platform !== 'win32') { assert.equal(code, 0, output); assert.match(output, /worker_stopped/); }
   assert.equal(output.includes('jane@example.com'), false);
   assert.equal(output.includes(service.secret), false);
-  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 2);
+  assert.equal((await manager.streams.info(OUTPUT_STREAM)).state.messages, 1, 'actual worker published nothing to FIONAS_EVENTS');
 
   // Live stream viewers skip history and use independent ephemeral consumers, never the worker durable.
   const durableBeforeTail = await manager.consumers.info(INPUT_STREAM, CONSUMER);
@@ -222,9 +244,8 @@ test('real JetStream pipeline: restricted identity, lost responses, redelivery, 
     return viewer.stderr.includes('Watching');
   });
   for (const viewer of viewers) assert.equal(viewer.stdout, '', 'live tail must skip existing history');
-  const tailEvent = fixture(); tailEvent.id = randomUUID();
-  const liveOutcome = persistedEvent(tailEvent, receipt);
-  await adminJs.publish(OUTPUT_SUBJECT, bytes(liveOutcome));
+  const liveOutcome = simulatedCommerceEvent(randomUUID());
+  await adminJs.publish(SIMULATED_COMMERCE_SUBJECT, bytes(liveOutcome));
   // An additional inquiry subject proves the viewer sees the whole stream while the worker stays filtered.
   await adminJs.publish('fionas.inquiries.tail-test.v1', bytes({ synthetic: 'live inquiry stream message' }));
   for (const viewer of viewers) {

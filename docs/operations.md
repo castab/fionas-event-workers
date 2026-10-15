@@ -1,6 +1,12 @@
 # Operating inquiry-to-commerce
 
-Use a separate operator NATS context in the same account. Runtime keeps named-consumer INFO/NEXT/ACK/TERM and permission to publish the two explicit outcomes; it does not administer streams or consumers.
+Use a separate operator NATS context in the same account. Runtime keeps named-consumer INFO/NEXT/ACK/TERM and permission to publish only `fionas.events.inquiry.processing-failed.v1`; it does not administer streams or consumers and cannot publish any success event.
+
+## Responsibility split
+
+`fionas-web` produces `InquirySubmitted`. This worker transports it to the commerce API and records the failures it owns. `fionas-commerce` atomically commits the inquiry, initial Estimate and its success event into its transactional outbox; a commerce outbox publisher later delivers that event to `FIONAS_EVENTS`. Downstream consumers deduplicate independently. The worker ACKs after a valid `201` receipt and does not wait for, poll or verify the outbox publication. NATS remains part of this worker's failure-disposition workflow (`InquiryProcessingFailed`, then TERM).
+
+This relies on commerce guaranteeing that a valid `201` means the inquiry, Estimate and outbox event committed atomically, and that an idempotent replay returns the original receipt without a second outbox event. The worker cannot check this; see the cutover section below.
 
 ## Inspect and distinguish failure states
 
@@ -20,7 +26,7 @@ nats stream get FIONAS_INQUIRIES 42
 npm run nats:tail:events -- --all
 ```
 
-The source/tail includes customer data. Diagnostics on `fionas.events.inquiry.processing-failed.v1` include only input stream/sequence/error code, optional original UUID and a deterministic stored timestamp. Malformed JSON may have no UUID. A failure diagnostic never claims successful persistence, nor proves no inquiry exists. InquiryPersisted always requires a valid commerce receipt and confirmed outcome PubAck.
+The source/tail includes customer data. Diagnostics on `fionas.events.inquiry.processing-failed.v1` include only input stream/sequence/error code, optional original UUID and a deterministic stored timestamp. Malformed JSON may have no UUID. A failure diagnostic never claims successful persistence, nor proves no inquiry exists. A successful input ACK requires a valid commerce receipt and confirms only that commerce acknowledged the operation; whether commerce's outbox publisher has delivered the success event is observable only on the commerce side (outbox state) or by watching `FIONAS_EVENTS` with `npm run nats:tail:events`.
 
 Failure states differ:
 
@@ -50,8 +56,8 @@ The former one-hour poison delay could therefore hold inquiries for hours. Incre
    npm --silent run nats:retry:inquiry -- --sequence 42 --non-interactive
    ```
 
-   The command uses a temporary consumer starting at that sequence, verifies the exact delivered sequence/subject, and runs the same pipeline once. HTTP body/event UUID/idempotency and publication identities are preserved. It never rewinds, replaces, ACKs or modifies the primary durable. Non-success exits 1; retryable failures require another deliberate attempt after repair. Temporary state is deleted with inactivity expiry as fallback. Source payloads and secrets are never printed.
-3. Confirm `result:persisted`, the correlated InquiryPersisted and the backend inquiry/Estimate. Old failure diagnostics remain historical evidence. If original malformed/unsupported data remains invalid, recovery records the same deterministic failure and returns non-success. New/corrected business intent must go through its owning upstream workflow, not be silently rewritten here.
+   The command uses a temporary consumer starting at that sequence, verifies the exact delivered sequence/subject, and runs the same pipeline once. HTTP body, event UUID and idempotency key are preserved, and no success event is published. A permanently invalid input may still publish its deterministic failure diagnostic, as in normal processing. It never rewinds, replaces, ACKs or modifies the primary durable. Non-success exits 1; retryable failures require another deliberate attempt after repair. Temporary state is deleted with inactivity expiry as fallback. Source payloads and secrets are never printed.
+3. Confirm `result:persisted` and the backend inquiry/Estimate. `persisted` means commerce returned a valid receipt for the original idempotency key; the tool prints a note that outbox delivery is not verified. It does not prove commerce's outbox publisher already delivered an event to NATS, and replaying an already-committed inquiry never creates a new business event. Check the success event with commerce's outbox tooling or the tail command. Old failure diagnostics remain historical evidence. If original malformed/unsupported data remains invalid, recovery records the same deterministic failure and returns non-success. New/corrected business intent must go through its owning upstream workflow, not be silently rewritten here.
 4. Restart the primary worker. Before MaxDeliver, an unresolved original may redeliver after its NAK/ACK deadline, returning the same receipt/outcome safely. TERMed/exhausted originals keep their primary disposition; targeted recovery's success is recorded independently. Observe subsequent normal processing.
 
 The command is also packaged as `node scripts/nats-retry-inquiry.mjs --sequence 42` in the worker image. Mount secrets read-only and use container-reachable addresses as for setup. It needs operator source-message/temporary-consumer access plus the dedicated commerce SERVICE credential; no staff session or token-signing key is used.
@@ -60,8 +66,18 @@ Source retention bounds recovery. If the original expired, the command refuses t
 
 ## Provisioning and lifecycle
 
-Stream and durable settings are unchanged; no reset/migration is required. Add runtime publish permission for `fionas.events.inquiry.processing-failed.v1`, keeping existing success-publish and named ACK/TERM rights. The existing `fionas.events.>` filter captures it. Preserve the public publisher's permissions. Operator setup continues verifying configuration and refusing mismatches.
+Stream and durable settings are unchanged; no reset/migration is required. The runtime identity's publish permission is `fionas.events.inquiry.processing-failed.v1` only, plus the named INFO/NEXT/ACK/TERM rights; the former `fionas.events.inquiry.persisted.v1` permission is removed at cutover. The existing `fionas.events.>` stream filter captures failure diagnostics and commerce-published events alike. Preserve the public publisher's permissions and the commerce outbox publisher's own identity. Operator setup continues verifying configuration and refusing mismatches.
 
 A delayed NAK already scheduled by the old deployment keeps its deadline across upgrade/restart. The new policy applies when that source is next delivered; it does not silently rewrite durable state. Targeted recovery can repair the selected business operation immediately, but does not cancel that old primary delay. Account for its remaining bounded delay during rollout and inspect pending state; do not reset the whole durable merely to accelerate it.
 
-Use a supervisor with bounded restart backoff and alerting. SIGTERM/SIGINT stops new pulls and allows 55 seconds for current work; set termination grace to at least 60 seconds. Unfinished operations remain replayable. Lost success ACK responses may already be complete because HTTP receipt and PubAck were confirmed first. Failure TERM is sent only after its diagnostic PubAck; unconfirmed TERM can replay without false success.
+Use a supervisor with bounded restart backoff and alerting. SIGTERM/SIGINT stops new pulls and allows 55 seconds for current work; set termination grace to at least 60 seconds. Unfinished operations remain replayable. A lost input ACK request or response is recoverable: the input is redelivered and the identical request (same idempotency key and body) is replayed, returning the existing commerce receipt. Failure TERM is sent only after its diagnostic PubAck; unconfirmed TERM can replay without false success.
+
+## Cutover from the worker-published success event
+
+Do not deploy this worker, or merge into an auto-deployed branch, before commerce meets its half of the contract. Sequence: (1) release the shared transactional outbox infrastructure; (2) integrate it into `fionas-commerce`; (3) add commerce-owned `InquiryPersisted` outbox writes in the inquiry transaction; (4) configure the commerce NATS outbox publisher; (5) verify outbox-to-NATS publication; (6) deploy this worker and remove its `fionas.events.inquiry.persisted.v1` publish permission; (7) confirm only commerce publishes the authoritative success event.
+
+- Deploying earlier against a commerce `POST /inquiries` that commits without an outbox write would ACK inputs whose success event is never emitted. Deploying later leaves the old worker publishing a worker-owned event that commerce's event would duplicate. Coordinate both.
+- Keep the old and new success events distinct. The commerce-owned event has its own versioned contract, defined in commerce; do not assume it equals the retired worker-owned `InquiryPersisted v1`.
+- There is no legacy mode. If an interim dual-version deployment is unavoidable, document it explicitly rather than adding an implicit fallback.
+- Streams and the `inquiry-to-commerce` durable are unchanged. Do not delete, recreate, rewind or reset them. Do not rename streams.
+- Retained or in-flight inputs from before cutover are replayed with their original idempotency keys. For an inquiry already committed by the pre-outbox commerce, replay returns the existing receipt and must not create a new business event. If those older inquiries need a success event, that is a separate deliberate backfill owned by commerce.

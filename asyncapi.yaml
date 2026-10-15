@@ -1,10 +1,16 @@
 asyncapi: 3.1.0
 info:
-  title: Fiona's worker outcome events
-  version: 1.1.0
+  title: Fiona's worker diagnostic events
+  version: 2.0.0
   description: |
-    Committed operations and explicit processing failures published by independent workers.
+    Explicit processing-failure diagnostics published by independent workers into FIONAS_EVENTS.
+    These describe failures to process an incoming NATS message, never a committed change to
+    commerce business state.
     Incoming InquirySubmitted v1 is owned by castab/fionas-web/asyncapi.yaml.
+    Events describing successful changes to commerce state (including a future InquiryPersisted)
+    are owned, versioned and published by fionas-commerce through its transactional outbox and are
+    not defined here. 2.0.0 removed the former worker-owned InquiryPersisted v1; this worker no
+    longer publishes it and its runtime identity may not.
     Breaking changes need a new subject/version; consumers ignore additive unknown fields.
     Delivery is at least once. Nats-Msg-Id deduplicates publications for 24 hours only.
     Downstream side effects must independently deduplicate on the event id.
@@ -20,12 +26,6 @@ channels:
     messages:
       inquiryProcessingFailed:
         $ref: '#/components/messages/InquiryProcessingFailedV1'
-  inquiryPersistedV1:
-    address: fionas.events.inquiry.persisted.v1
-    description: Stored in the independent FIONAS_EVENTS stream (fionas.events.>).
-    messages:
-      inquiryPersisted:
-        $ref: '#/components/messages/InquiryPersistedV1'
 operations:
   publishInquiryProcessingFailed:
     action: send
@@ -37,15 +37,6 @@ operations:
       Requires a valid PubAck from FIONAS_EVENTS before TERM of this input delivery.
       This is never a success ACK or a claim that commerce did or did not commit.
       Systemic errors and transient exhaustion do not produce this event.
-  publishInquiryPersisted:
-    action: send
-    channel:
-      $ref: '#/channels/inquiryPersistedV1'
-    messages:
-      - $ref: '#/channels/inquiryPersistedV1/messages/inquiryPersisted'
-    description: |
-      Published only after a valid commerce 201 receipt. Requires PubAck with expected
-      stream FIONAS_EVENTS, then and only then ACKs the incoming InquirySubmitted.
 components:
   messages:
     InquiryProcessingFailedV1:
@@ -77,32 +68,6 @@ components:
               inputStream: FIONAS_INQUIRIES
               inputSequence: 42
               errorCode: invalid_event_json
-    InquiryPersistedV1:
-      name: InquiryPersisted
-      title: Inquiry persisted (v1)
-      summary: Commerce committed an inquiry and its canonical initial Estimate; not a booking or payment.
-      headers:
-        $ref: '#/components/schemas/InquiryPersistedHeaders'
-      payload:
-        $ref: '#/components/schemas/InquiryPersistedV1'
-      examples:
-        - name: syntheticBirthday
-          headers:
-            Nats-Msg-Id: 'fionas.inquiry.persisted.v1:0f8b5a3e-6c2d-4f1a-9b7e-3d4c5b6a7e8f'
-            Nats-Expected-Stream: FIONAS_EVENTS
-          payload:
-            schemaVersion: 1
-            type: fionas.inquiry.persisted
-            id: 'fionas.inquiry.persisted.v1:0f8b5a3e-6c2d-4f1a-9b7e-3d4c5b6a7e8f'
-            correlationId: 0f8b5a3e-6c2d-4f1a-9b7e-3d4c5b6a7e8f
-            occurredAt: '2026-10-14T18:30:00.321012Z'
-            source: fionas-event-workers
-            data:
-              inquiryId: c755f7cd-1e28-4c75-a85f-d066ede7387d
-              customer:
-                name: Jane Doe
-                email: jane@example.com
-              eventDate: '2026-12-05'
   schemas:
     InquiryProcessingFailedV1:
       type: object
@@ -144,63 +109,3 @@ components:
             errorCode:
               type: string
               enum: [invalid_event_json, invalid_inquiry_submitted, unsupported_event_type_or_version, commerce_input_rejected, idempotency_key_reused]
-    InquiryPersistedHeaders:
-      type: object
-      required: [Nats-Msg-Id, Nats-Expected-Stream]
-      properties:
-        Nats-Msg-Id:
-          type: string
-          description: Same deterministic identity as the payload id.
-          pattern: '^fionas\.inquiry\.persisted\.v1:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-        Nats-Expected-Stream:
-          type: string
-          const: FIONAS_EVENTS
-    InquiryPersistedV1:
-      type: object
-      additionalProperties: false
-      required: [schemaVersion, type, id, correlationId, occurredAt, source, data]
-      properties:
-        schemaVersion:
-          type: integer
-          const: 1
-        type:
-          type: string
-          const: fionas.inquiry.persisted
-        id:
-          type: string
-          pattern: '^fionas\.inquiry\.persisted\.v1:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-          description: Deterministically derived from outgoing type/version and original submission UUID.
-        correlationId:
-          type: string
-          format: uuid
-          description: Original envelope id, not the public submission-key header.
-        occurredAt:
-          type: string
-          format: date-time
-          description: Commerce receipt createdAt verbatim; fixed across retries, UTC with up to microseconds.
-        source:
-          type: string
-          const: fionas-event-workers
-        data:
-          type: object
-          additionalProperties: false
-          required: [inquiryId, customer, eventDate]
-          properties:
-            inquiryId:
-              type: string
-              format: uuid
-            customer:
-              type: object
-              additionalProperties: false
-              required: [name, email]
-              description: Original submitted contact details, not normalized/stored-customer lookup data.
-              properties:
-                name:
-                  type: string
-                  minLength: 1
-                email:
-                  type: string
-                  minLength: 1
-            eventDate:
-              type: string
-              format: date

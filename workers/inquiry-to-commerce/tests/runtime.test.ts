@@ -19,7 +19,7 @@ test('systemic configuration failure stops before pulling or terminally rejectin
   } finally { shutdown.dispose(); }
 });
 
-test('shutdown stops new pulls and lets the current operation confirm publication/ACK', async () => {
+test('shutdown stops new pulls and lets the current operation finish and confirm its ACK', async () => {
   let pulls = 0, acknowledged = false, published = false;
   const shutdown = new Shutdown(() => assert.fail('deadline should not fire'), 1000);
   const message = { data: bytes(fixture()), info: { streamSequence: 1, deliveryCount: 1 },
@@ -29,7 +29,7 @@ test('shutdown stops new pulls and lets the current operation confirm publicatio
       commerce: { createInquiry: async () => { shutdown.stop(); await new Promise(resolve => setTimeout(resolve, 10)); return receipt; } },
       publish: async () => { published = true; return { stream: 'FIONAS_EVENTS', seq: 1, duplicate: false }; }, log() {},
     }, shutdown);
-    assert.equal(pulls, 1); assert.equal(published, true); assert.equal(acknowledged, true);
+    assert.equal(pulls, 1); assert.equal(published, false, 'success publishes no event'); assert.equal(acknowledged, true);
   } finally { shutdown.dispose(); }
 });
 test('deadline aborts unfinished HTTP and leaves the input unacknowledged', async () => {
