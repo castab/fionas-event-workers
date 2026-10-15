@@ -9,19 +9,21 @@ function required(env: Env, key: string): string {
   if (!value?.trim()) throw new Error(`Missing ${key}`);
   return value;
 }
-export function natsConfig(env: Env): { url: string; credsFile?: string; user?: string; pass?: string } {
+export function natsConfig(env: Env): { url: string; credsFile?: string; user?: string; pass?: string; token?: string } {
   const url = required(env, 'NATS_URL');
   let parsed: URL;
   try { parsed = new URL(url); } catch { throw new Error('Invalid NATS_URL'); }
   if (!['nats:', 'tls:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new Error('NATS_URL must use nats:// or tls:// without embedded credentials');
   }
-  if (env.NATS_CREDS_FILE && (env.NATS_USER || env.NATS_PASSWORD)) throw new Error('Choose NATS_CREDS_FILE or NATS_USER/NATS_PASSWORD');
+  const methods = [env.NATS_CREDS_FILE, env.NATS_USER || env.NATS_PASSWORD, env.NATS_TOKEN].filter(Boolean).length;
+  if (methods > 1) throw new Error('Choose NATS_CREDS_FILE, NATS_USER/NATS_PASSWORD or NATS_TOKEN');
   if (!!env.NATS_USER !== !!env.NATS_PASSWORD) throw new Error('NATS_USER and NATS_PASSWORD must be supplied together');
   return {
     url,
     ...(env.NATS_CREDS_FILE ? { credsFile: env.NATS_CREDS_FILE } : {}),
     ...(env.NATS_USER ? { user: env.NATS_USER, pass: env.NATS_PASSWORD! } : {}),
+    ...(env.NATS_TOKEN ? { token: env.NATS_TOKEN } : {}),
   };
 }
 export function workerConfig(env: Env = process.env) {
@@ -45,5 +47,6 @@ export async function connectionOptions(config: ReturnType<typeof natsConfig>, n
     maxReconnectAttempts: -1, reconnectTimeWait: 2_000,
     ...(config.credsFile ? { authenticator: credsAuthenticator(await readFile(config.credsFile)) } : {}),
     ...(config.user ? { user: config.user, pass: config.pass! } : {}),
+    ...(config.token ? { token: config.token } : {}),
   };
 }

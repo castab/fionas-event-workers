@@ -97,17 +97,19 @@ npm run nats:setup
 npm run nats:setup -- --retention-days 30 --replicas 1
 ```
 
-The command builds the worker and launches `scripts/nats-setup.mjs`. It asks for a `nats://` or `tls://` address (default `NATS_URL` or localhost), then an operator `.creds` path, username/password, or explicitly selected unauthenticated local development. Environment values supply prompt defaults; password characters/defaults are never displayed. Ctrl+C cancels and restores the terminal. Credentials stay in memory and are not written to a file. No commerce credentials or additional confirmation prompt are required.
+The command builds the worker and launches `scripts/nats-setup.mjs`. It asks for a `nats://` or `tls://` address (default `NATS_URL` or localhost), then an operator `.creds` path, username/password, explicitly selected unauthenticated local development, or a preshared token (hidden). Environment values supply prompt defaults; password characters/defaults are never displayed. Ctrl+C cancels and restores the terminal. Credentials stay in memory and are not written to a file. No commerce credentials or additional confirmation prompt are required.
 
-For automation, export `NATS_URL` and either `NATS_CREDS_FILE` or both `NATS_USER`/`NATS_PASSWORD`, then:
+For automation, export `NATS_URL` and one of `NATS_CREDS_FILE`, both `NATS_USER`/`NATS_PASSWORD`, or `NATS_TOKEN`, then:
 
 ```sh
 npm run nats:setup -- --non-interactive --retention-days 30 --replicas 1
 ```
 
-Without a terminal, `--non-interactive` is required. Do not combine credentials-file and username/password variables. Direct `.mjs` execution requires an existing worker build (already included in the Docker image).
+Without a terminal, `--non-interactive` is required. Supply exactly one authentication method. Direct `.mjs` execution requires an existing worker build (already included in the Docker image).
 
 Setup displays every explicitly managed stream/consumer property before provisioning, with NATS duration values in nanoseconds, then reports each resource as created or verified. It checks existing resources before creating missing ones and reports mismatched properties with existing/desired values, with no update operation. Operators must deliberately reconcile differences. If a creation fails after another resource was created, that new resource is retained; rerunning safely verifies it. Outcomes use file storage, limits retention, 30-day default finite retention, a 24-hour duplicate window and disabled message deletion/purge/rollup. Retention days must be finite, positive integers. Review customer-data retention before increasing them.
+
+To automate the commerce steps below, run `npm run commerce:setup`. It prompts for the `fionas-commerce` base URL, a trusted browser Origin (it must be listed in commerce's `FIONAS_TRUSTED_ORIGINS`) and an administrator username/password (hidden), logs in, shows what it will do and asks for confirmation (`--yes` skips it). It verifies or creates the `inquiry-to-commerce` SERVICE and the `fionas.inquiry-worker` role, refuses to touch a role whose permissions are not exactly `fionas.inquiries.create`, assigns the role and issues a **new** credential on every run. The secret is written once to a private file (default `commerce-service.secret`, gitignored, never overwritten; choose another with `--secret-out`) or printed with `--print-secret`; the administrator password is never stored, and the administrator session is logged out afterwards. The administrator needs `commerce.principal.manage`, `commerce.role.manage`, `commerce.role.assign` and `commerce.service-credential.manage`, which the bootstrap Administrator role holds. Login is limited to five attempts per IP burst. The manual steps it performs are:
 
 In commerce, log in as an authorized administrator, with its existing trusted Origin requirements. Use the existing administration endpoints to:
 
@@ -138,6 +140,7 @@ The second ACK pattern supports domain/account-hash ACK subjects while staying s
 | `NATS_URL` | Required single `nats://` or `tls://` server URL without embedded credentials |
 | `NATS_CREDS_FILE` | Optional mounted JWT credentials path; exclusive with user/password |
 | `NATS_USER`, `NATS_PASSWORD` | Supported pair, development or operator-approved alternative |
+| `NATS_TOKEN` | Preshared server token; exclusive with the other methods. A token server has no per-client permissions, so the worker then holds full access rather than the scoped runtime permissions below. Prefer per-identity credentials when the server supports them |
 | `COMMERCE_BASE_URL` | Required HTTP(S) origin; no credentials, path, query or fragment |
 | `COMMERCE_SERVICE_ID` | Required dedicated SERVICE UUID |
 | `COMMERCE_SERVICE_SECRET` | SERVICE credential; exclusive with secret file |
