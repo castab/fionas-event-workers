@@ -26,6 +26,15 @@ test('authentication choice isolates selected credentials; passwords have no vis
   const none = answers(['', '3']);
   assert.deepEqual(await collectConnection({ NATS_USER: 'operator', NATS_PASSWORD: secret }, none.ask), { NATS_URL: 'nats://localhost:4222' });
 });
+test('token authentication is hidden and keeps a configured token on Enter', async () => {
+  const secret = 'synthetic-private-token';
+  const prompt = answers(['', '4', '']);
+  assert.deepEqual(await collectConnection({ NATS_TOKEN: secret }, prompt.ask), { NATS_URL: 'nats://localhost:4222', NATS_TOKEN: secret });
+  assert.equal(prompt.questions[1].options.defaultValue, '4');
+  assert.equal(prompt.questions[2].options.secret, true);
+  assert.equal(JSON.stringify(prompt.questions).includes(secret), false);
+  await assert.rejects(collectConnection({}, answers(['', '4', '']).ask));
+});
 test('invalid authentication/credentials and embedded secrets fail without being echoed', async () => {
   for (const replies of [['', 'bad'], ['', '1', ''], ['', '2', '', 'password'], ['', '2', 'operator', '']]) {
     await assert.rejects(collectConnection({}, answers(replies).ask));

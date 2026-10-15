@@ -26,7 +26,7 @@ export async function retryInquiry(argv = process.argv.slice(2), env = process.e
   process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
   try {
     const selected = values['non-interactive'] ? env : await collectConnection(env, undefined, controller.signal);
-    const config = workerConfig({ ...env, NATS_URL: undefined, NATS_CREDS_FILE: undefined, NATS_USER: undefined, NATS_PASSWORD: undefined, ...selected });
+    const config = workerConfig({ ...env, NATS_URL: undefined, NATS_CREDS_FILE: undefined, NATS_USER: undefined, NATS_PASSWORD: undefined, NATS_TOKEN: undefined, ...selected });
     const secret = config.commerce.secret ?? (await readFile(config.commerce.secretFile, 'utf8')).trim();
     if (!secret.trim()) throw new SetupError('Commerce service secret is empty.');
     controller.signal.throwIfAborted();

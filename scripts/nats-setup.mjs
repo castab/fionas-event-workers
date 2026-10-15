@@ -77,8 +77,8 @@ export async function collectConnection(env, ask = terminalQuestion, signal) {
   }
   const withDefault = async (label, value) => (await ask(label, { defaultValue: value, signal })).trim() || value;
   const url = await withDefault('NATS server address', defaultUrl);
-  const defaultMethod = env.NATS_CREDS_FILE ? '1' : env.NATS_USER ? '2' : '1';
-  const method = await withDefault('Operator authentication: 1 = .creds file, 2 = username/password, 3 = none (local development only)', defaultMethod);
+  const defaultMethod = env.NATS_CREDS_FILE ? '1' : env.NATS_USER ? '2' : env.NATS_TOKEN ? '4' : '1';
+  const method = await withDefault('Operator authentication: 1 = .creds file, 2 = username/password, 3 = none (local development only), 4 = token', defaultMethod);
   const result = { NATS_URL: url };
   if (method === '1') {
     result.NATS_CREDS_FILE = await withDefault('Operator .creds file path', env.NATS_CREDS_FILE ?? '');
@@ -88,7 +88,11 @@ export async function collectConnection(env, ask = terminalQuestion, signal) {
     const label = env.NATS_PASSWORD ? 'Operator password (Enter keeps configured password)' : 'Operator password';
     result.NATS_PASSWORD = await ask(label, { secret: true, signal }) || env.NATS_PASSWORD || '';
     if (!result.NATS_USER || !result.NATS_PASSWORD) throw new SetupError('Operator username and password are required.');
-  } else if (method !== '3') throw new SetupError('Choose authentication option 1, 2 or 3.');
+  } else if (method === '4') {
+    const label = env.NATS_TOKEN ? 'Token (Enter keeps configured token)' : 'Token';
+    result.NATS_TOKEN = await ask(label, { secret: true, signal }) || env.NATS_TOKEN || '';
+    if (!result.NATS_TOKEN) throw new SetupError('A token is required.');
+  } else if (method !== '3') throw new SetupError('Choose authentication option 1, 2, 3 or 4.');
   return result;
 }
 
@@ -101,7 +105,7 @@ export async function setup(argv = process.argv.slice(2), env = process.env) {
     } }));
   } catch { throw new SetupError('Invalid setup options; use --help.'); }
   if (values.help) {
-    console.log('Usage: node scripts/nats-setup.mjs [--retention-days 30] [--replicas 1] [--non-interactive]\nInteractive setup prompts for a server and operator credentials. Automation uses NATS_URL and NATS_CREDS_FILE or NATS_USER/NATS_PASSWORD.');
+    console.log('Usage: node scripts/nats-setup.mjs [--retention-days 30] [--replicas 1] [--non-interactive]\nInteractive setup prompts for a server and operator credentials. Automation uses NATS_URL and NATS_CREDS_FILE, NATS_USER/NATS_PASSWORD or NATS_TOKEN.');
     return;
   }
   if (!values['non-interactive'] && (!process.stdin.isTTY || !process.stdout.isTTY)) {

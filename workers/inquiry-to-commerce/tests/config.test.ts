@@ -12,6 +12,13 @@ test('configuration validates required values and avoids embedded credentials', 
   assert.throws(() => natsConfig({ NATS_URL: env.NATS_URL, NATS_USER: 'user' }));
   assert.throws(() => natsConfig({ NATS_URL: env.NATS_URL, NATS_CREDS_FILE: '/creds', NATS_USER: 'user', NATS_PASSWORD: 'secret' }));
 });
+test('a preshared token is a third authentication method, exclusive with the others', () => {
+  const url = 'nats://localhost:4222';
+  assert.deepEqual(natsConfig({ NATS_URL: url, NATS_TOKEN: 'synthetic-token' }), { url, token: 'synthetic-token' });
+  for (const other of [{ NATS_CREDS_FILE: '/creds' }, { NATS_USER: 'user', NATS_PASSWORD: 'secret' }, { NATS_PASSWORD: 'secret' }]) {
+    assert.throws(() => natsConfig({ NATS_URL: url, NATS_TOKEN: 'synthetic-token', ...other }), (error: Error) => !error.message.includes('synthetic-token'));
+  }
+});
 test('provisioning defaults are finite, distinct and bounded; differences report rather than overwrite', () => {
   const stream = outcomeStreamConfig();
   assert.equal(stream.max_age, 30 * 86_400_000_000_000);
