@@ -1,0 +1,206 @@
+asyncapi: 3.1.0
+info:
+  title: Fiona's worker outcome events
+  version: 1.1.0
+  description: |
+    Committed operations and explicit processing failures published by independent workers.
+    Incoming InquirySubmitted v1 is owned by castab/fionas-web/asyncapi.yaml.
+    Breaking changes need a new subject/version; consumers ignore additive unknown fields.
+    Delivery is at least once. Nats-Msg-Id deduplicates publications for 24 hours only.
+    Downstream side effects must independently deduplicate on the event id.
+defaultContentType: application/json
+servers:
+  local:
+    host: localhost:4222
+    protocol: nats
+channels:
+  inquiryProcessingFailedV1:
+    address: fionas.events.inquiry.processing-failed.v1
+    description: Durable permanent per-message disposition, stored in the existing FIONAS_EVENTS stream.
+    messages:
+      inquiryProcessingFailed:
+        $ref: '#/components/messages/InquiryProcessingFailedV1'
+  inquiryPersistedV1:
+    address: fionas.events.inquiry.persisted.v1
+    description: Stored in the independent FIONAS_EVENTS stream (fionas.events.>).
+    messages:
+      inquiryPersisted:
+        $ref: '#/components/messages/InquiryPersistedV1'
+operations:
+  publishInquiryProcessingFailed:
+    action: send
+    channel:
+      $ref: '#/channels/inquiryProcessingFailedV1'
+    messages:
+      - $ref: '#/channels/inquiryProcessingFailedV1/messages/inquiryProcessingFailed'
+    description: |
+      Requires a valid PubAck from FIONAS_EVENTS before TERM of this input delivery.
+      This is never a success ACK or a claim that commerce did or did not commit.
+      Systemic errors and transient exhaustion do not produce this event.
+  publishInquiryPersisted:
+    action: send
+    channel:
+      $ref: '#/channels/inquiryPersistedV1'
+    messages:
+      - $ref: '#/channels/inquiryPersistedV1/messages/inquiryPersisted'
+    description: |
+      Published only after a valid commerce 201 receipt. Requires PubAck with expected
+      stream FIONAS_EVENTS, then and only then ACKs the incoming InquirySubmitted.
+components:
+  messages:
+    InquiryProcessingFailedV1:
+      name: InquiryProcessingFailed
+      title: Inquiry processing failed (v1)
+      summary: A permanent per-message failure was durably recorded for operator recovery.
+      headers:
+        type: object
+        required: [Nats-Msg-Id, Nats-Expected-Stream]
+        properties:
+          Nats-Msg-Id:
+            type: string
+            description: Same deterministic identity as payload id.
+            pattern: '^fionas\.inquiry\.processing-failed\.v1:FIONAS_INQUIRIES:[1-9][0-9]*$'
+          Nats-Expected-Stream:
+            type: string
+            const: FIONAS_EVENTS
+      payload:
+        $ref: '#/components/schemas/InquiryProcessingFailedV1'
+      examples:
+        - name: malformedInput
+          payload:
+            schemaVersion: 1
+            type: fionas.inquiry.processing-failed
+            id: 'fionas.inquiry.processing-failed.v1:FIONAS_INQUIRIES:42'
+            occurredAt: '2026-10-14T18:30:00.123456789Z'
+            source: fionas-event-workers
+            data:
+              inputStream: FIONAS_INQUIRIES
+              inputSequence: 42
+              errorCode: invalid_event_json
+    InquiryPersistedV1:
+      name: InquiryPersisted
+      title: Inquiry persisted (v1)
+      summary: Commerce committed an inquiry and its canonical initial Estimate; not a booking or payment.
+      headers:
+        $ref: '#/components/schemas/InquiryPersistedHeaders'
+      payload:
+        $ref: '#/components/schemas/InquiryPersistedV1'
+      examples:
+        - name: syntheticBirthday
+          headers:
+            Nats-Msg-Id: 'fionas.inquiry.persisted.v1:0f8b5a3e-6c2d-4f1a-9b7e-3d4c5b6a7e8f'
+            Nats-Expected-Stream: FIONAS_EVENTS
+          payload:
+            schemaVersion: 1
+            type: fionas.inquiry.persisted
+            id: 'fionas.inquiry.persisted.v1:0f8b5a3e-6c2d-4f1a-9b7e-3d4c5b6a7e8f'
+            correlationId: 0f8b5a3e-6c2d-4f1a-9b7e-3d4c5b6a7e8f
+            occurredAt: '2026-10-14T18:30:00.321012Z'
+            source: fionas-event-workers
+            data:
+              inquiryId: c755f7cd-1e28-4c75-a85f-d066ede7387d
+              customer:
+                name: Jane Doe
+                email: jane@example.com
+              eventDate: '2026-12-05'
+  schemas:
+    InquiryProcessingFailedV1:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, type, id, occurredAt, source, data]
+      properties:
+        schemaVersion:
+          type: integer
+          const: 1
+        type:
+          type: string
+          const: fionas.inquiry.processing-failed
+        id:
+          type: string
+          pattern: '^fionas\.inquiry\.processing-failed\.v1:FIONAS_INQUIRIES:[1-9][0-9]*$'
+          description: Derived from input stream and stored sequence; stable through failure-disposition retries.
+        correlationId:
+          type: string
+          format: uuid
+          description: Original envelope id when safely extractable, including unsupported event versions; omitted for malformed input.
+        occurredAt:
+          type: string
+          format: date-time
+          description: Original JetStream stored timestamp verbatim, up to nanosecond precision. This fixes replay identity; it is not a failure-detection timestamp.
+        source:
+          type: string
+          const: fionas-event-workers
+        data:
+          type: object
+          additionalProperties: false
+          required: [inputStream, inputSequence, errorCode]
+          properties:
+            inputStream:
+              type: string
+              const: FIONAS_INQUIRIES
+            inputSequence:
+              type: integer
+              minimum: 1
+            errorCode:
+              type: string
+              enum: [invalid_event_json, invalid_inquiry_submitted, unsupported_event_type_or_version, commerce_input_rejected, idempotency_key_reused]
+    InquiryPersistedHeaders:
+      type: object
+      required: [Nats-Msg-Id, Nats-Expected-Stream]
+      properties:
+        Nats-Msg-Id:
+          type: string
+          description: Same deterministic identity as the payload id.
+          pattern: '^fionas\.inquiry\.persisted\.v1:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+        Nats-Expected-Stream:
+          type: string
+          const: FIONAS_EVENTS
+    InquiryPersistedV1:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, type, id, correlationId, occurredAt, source, data]
+      properties:
+        schemaVersion:
+          type: integer
+          const: 1
+        type:
+          type: string
+          const: fionas.inquiry.persisted
+        id:
+          type: string
+          pattern: '^fionas\.inquiry\.persisted\.v1:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          description: Deterministically derived from outgoing type/version and original submission UUID.
+        correlationId:
+          type: string
+          format: uuid
+          description: Original envelope id, not the public submission-key header.
+        occurredAt:
+          type: string
+          format: date-time
+          description: Commerce receipt createdAt verbatim; fixed across retries, UTC with up to microseconds.
+        source:
+          type: string
+          const: fionas-event-workers
+        data:
+          type: object
+          additionalProperties: false
+          required: [inquiryId, customer, eventDate]
+          properties:
+            inquiryId:
+              type: string
+              format: uuid
+            customer:
+              type: object
+              additionalProperties: false
+              required: [name, email]
+              description: Original submitted contact details, not normalized/stored-customer lookup data.
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                email:
+                  type: string
+                  minLength: 1
+            eventDate:
+              type: string
+              format: date

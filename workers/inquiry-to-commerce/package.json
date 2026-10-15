@@ -1,0 +1,17 @@
+{
+  "name": "@fionas/inquiry-to-commerce",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=26 <27" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/workers/inquiry-to-commerce/src/main.js",
+    "dev": "node --env-file=../../.env src/main.ts"
+  },
+  "dependencies": {
+    "@fionas/events": "0.1.0",
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/transport-node": "3.4.0"
+  }
+}

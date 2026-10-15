@@ -1,0 +1,21 @@
+{
+  "name": "fionas-event-workers",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=26 <27" },
+  "workspaces": ["workers/*", "packages/*"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p workers/inquiry-to-commerce/tsconfig.json",
+    "test": "node --test workers/inquiry-to-commerce/tests/*.test.*",
+    "test:integration": "npm run build --workspace @fionas/inquiry-to-commerce && docker build -f workers/inquiry-to-commerce/Dockerfile -t fionas-inquiry-to-commerce:test . && node --test workers/inquiry-to-commerce/tests/integration/*.test.ts",
+    "start": "npm start --workspace @fionas/inquiry-to-commerce",
+    "nats:setup": "npm run build --workspace @fionas/inquiry-to-commerce && node scripts/nats-setup.mjs",
+    "nats:tail:events": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-tail.mjs events",
+    "nats:tail:inquiries": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-tail.mjs inquiries",
+    "nats:retry:inquiry": "npm run build --silent --workspace @fionas/inquiry-to-commerce && node scripts/nats-retry-inquiry.mjs",
+    "nats:up": "docker compose up -d --wait nats",
+    "nats:down": "docker compose down"
+  },
+  "devDependencies": { "@types/node": "26.6.5", "typescript": "7.0.2" }
+}
