@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { commerceRequest, parseSubmitted } from '../src/transform.ts';
-import { persistedEvent } from '../../../packages/events/src/index.ts';
-import { bytes, fixture, receipt } from './fixtures.ts';
+import { processingFailedEvent } from '../../../packages/events/src/index.ts';
+import { bytes, fixture } from './fixtures.ts';
 
 test('maps every supported field and preserves line order and exact strings without event metadata', () => {
   const event = fixture();
@@ -56,13 +56,18 @@ test('financial business validation remains with commerce', () => {
   event.data.lines[0]!.unitPrice = '0.125'; // structurally usable but flat USD price fails backend settlement rules
   assert.equal(commerceRequest(parseSubmitted(bytes(event))).lines[0]?.unitPrice, '0.125');
 });
-test('outcome is deterministic, minimal, and uses original contact details and receipt timestamp', () => {
+test('HTTP projection is byte-identical across retries of the same input', () => {
+  const first = JSON.stringify(commerceRequest(parseSubmitted(bytes(fixture()))));
+  assert.equal(first, JSON.stringify(commerceRequest(parseSubmitted(bytes(fixture())))));
+});
+test('processing-failure event is deterministic and minimal; this worker defines no success event', () => {
   const event = fixture();
-  const outcome = persistedEvent(event, receipt);
-  assert.deepEqual(outcome, {
-    schemaVersion: 1, type: 'fionas.inquiry.persisted', id: `fionas.inquiry.persisted.v1:${event.id}`,
-    correlationId: event.id, occurredAt: receipt.createdAt, source: 'fionas-event-workers',
-    data: { inquiryId: receipt.id, customer: { name: event.data.name, email: event.data.email }, eventDate: event.data.eventDate },
+  const failure = processingFailedEvent(42, '2026-10-14T18:30:00.123456789Z', 'invalid_event_json', event.id);
+  assert.deepEqual(failure, {
+    schemaVersion: 1, type: 'fionas.inquiry.processing-failed', id: 'fionas.inquiry.processing-failed.v1:FIONAS_INQUIRIES:42',
+    correlationId: event.id, occurredAt: '2026-10-14T18:30:00.123456789Z', source: 'fionas-event-workers',
+    data: { inputStream: 'FIONAS_INQUIRIES', inputSequence: 42, errorCode: 'invalid_event_json' },
   });
-  assert.equal(JSON.stringify(outcome), JSON.stringify(persistedEvent(fixture(), { ...receipt })));
+  assert.equal(JSON.stringify(failure), JSON.stringify(processingFailedEvent(42, '2026-10-14T18:30:00.123456789Z', 'invalid_event_json', event.id)));
+  assert.equal('correlationId' in processingFailedEvent(42, '2026-10-14T18:30:00Z', 'invalid_event_json'), false);
 });

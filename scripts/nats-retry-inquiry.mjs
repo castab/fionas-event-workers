@@ -48,7 +48,12 @@ export async function retryInquiry(argv = process.argv.slice(2), env = process.e
       log: (level, event, fields) => console.error(JSON.stringify({ level, event, ...fields })),
     }, controller.signal);
     await nc.flush();
-    console.log(JSON.stringify({ streamSequence: sequence, result }));
+    // 'persisted' means commerce returned a valid receipt for the original idempotency key and the
+    // retained input was ACKed by this temporary consumer. It does not prove that commerce's outbox
+    // publisher has delivered InquiryPersisted to NATS; verify that on the commerce side.
+    const output = { streamSequence: sequence, result };
+    if (result === 'persisted') output.note = 'Commerce confirmed the original operation; outbox event delivery is not verified by this tool.';
+    console.log(JSON.stringify(output));
     if (result !== 'persisted') process.exitCode = 1;
   } catch (error) {
     console.error(JSON.stringify({ event: 'recovery_failed', ...failureFields(error) }));

@@ -2,7 +2,6 @@ export const INPUT_STREAM = 'FIONAS_INQUIRIES';
 export const INPUT_SUBJECT = 'fionas.inquiries.submitted.v1';
 export const CONSUMER = 'inquiry-to-commerce';
 export const OUTPUT_STREAM = 'FIONAS_EVENTS';
-export const OUTPUT_SUBJECT = 'fionas.events.inquiry.persisted.v1';
 export const FAILURE_SUBJECT = 'fionas.events.inquiry.processing-failed.v1';
 
 // This is a narrow transport view, not a copy of the producer's complete schema.
@@ -41,6 +40,7 @@ export interface InquirySubmitted {
   source: 'fionas-web';
   data: InquiryData;
 }
+// Validated commerce HTTP 201 receipt. It is not an event; commerce owns the success event.
 export interface InquiryReceipt { id: string; createdAt: string }
 export interface InquiryProcessingFailed {
   schemaVersion: 1;
@@ -59,30 +59,5 @@ export function processingFailedEvent(sequence: number, storedAt: string, code: 
     ...(eventId ? { correlationId: eventId } : {}),
     occurredAt: storedAt, source: 'fionas-event-workers',
     data: { inputStream: INPUT_STREAM, inputSequence: sequence, errorCode: code },
-  };
-}
-export interface InquiryPersisted {
-  schemaVersion: 1;
-  type: 'fionas.inquiry.persisted';
-  id: string;
-  correlationId: string;
-  occurredAt: string;
-  source: 'fionas-event-workers';
-  data: { inquiryId: string; customer: { name: string; email: string }; eventDate: string };
-}
-
-export function persistedEvent(input: InquirySubmitted, receipt: InquiryReceipt): InquiryPersisted {
-  return {
-    schemaVersion: 1,
-    type: 'fionas.inquiry.persisted',
-    id: `fionas.inquiry.persisted.v1:${input.id}`,
-    correlationId: input.id,
-    occurredAt: receipt.createdAt,
-    source: 'fionas-event-workers',
-    data: {
-      inquiryId: receipt.id,
-      customer: { name: input.data.name, email: input.data.email },
-      eventDate: input.data.eventDate,
-    },
   };
 }
