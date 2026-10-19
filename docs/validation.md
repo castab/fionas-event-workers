@@ -49,3 +49,20 @@ Corrected regressions prove failure PubAck before TERM, deterministic failure by
 The actual entrypoint exits 1 on a real stub 403 after one inquiry POST, leaves both sources retained, emits no permanent failure or persistence event, and never processes the next queued customer. Existing lost-HTTP-response, success-PubAck-loss, duplicate publication, restart/reconnect, independent consumers and graceful-shutdown regressions still pass. Docker checks include the packaged recovery CLI and existing setup/tail/worker startup lifecycle.
 
 Current upstream main refs were fetched and remained at the audited web/commerce SHAs. Their event, OpenAPI, SERVICE and receipt contracts were rechecked without upstream edits. The full real-commerce/web smoke was documented but not executed; it requires a privately provisioned local backend/SERVICE and web configuration. NATS production permissions also require operator application of the new explicit failure-publish subject. No consumer settings changed and no durable reset is needed.
+
+## Commerce outbox handoff — 2026-10-15
+
+Worker-side migration only: success-event ownership moved to `fionas-commerce`; the worker now ACKs after a valid commerce receipt and publishes only `InquiryProcessingFailed`.
+
+| Check | Result |
+|---|---|
+| `npm run typecheck` | Passed |
+| `npm test` | 82 tests passed; zero failed/skipped |
+| `npm run build --workspace @fionas/inquiry-to-commerce` | Passed |
+| `npm run test:integration` | 4 real-NATS 2.14.7 scenarios passed; zero skipped. Includes the production-image build (`docker build -f workers/inquiry-to-commerce/Dockerfile`) and packaged-image setup/tail/retry/worker startup, non-root `node`, clean `docker stop` exit 0 |
+| AsyncAPI 2.0.0 | Temporary out-of-tree YAML/Ajv check: all `$ref`s resolve, no stale InquiryPersisted definitions, the message example and a payload built by `processingFailedEvent` validate against `InquiryProcessingFailedV1`, and the `Nats-Msg-Id` pattern matches. No AsyncAPI CLI was run and no dependency was added |
+| `git diff --check` | Passed |
+
+The real-NATS suite verifies that a successful inquiry adds nothing to `FIONAS_EVENTS`, that the worker identity is refused when publishing a success subject, lost HTTP responses and lost input ACKs replay the identical key and body, failure-diagnostic and targeted-recovery behavior is unchanged, and that the recovery tool reports `persisted` with a note that outbox delivery is not verified. A separate operator identity publishes an opaque synthetic message to stand in for commerce's outbox publisher.
+
+**Not validated:** the HTTP stub only *models* the atomic commerce receipt contract (one simulated outbox append per idempotency key, none on replay). The real PostgreSQL outbox, commerce's outbox publisher, and the full `fionas-web → … → FIONAS_EVENTS` smoke test in `manual-smoke.md` were not run; they require the commerce integration that does not exist yet. The change must not be deployed before that integration (see README, Deployment cutover).

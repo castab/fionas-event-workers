@@ -9,7 +9,7 @@ import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { connect } from '@nats-io/transport-node';
 import { jetstream, jetstreamManager, RetentionPolicy, StorageType } from '@nats-io/jetstream';
-import { CONSUMER, INPUT_STREAM, INPUT_SUBJECT, OUTPUT_STREAM, FAILURE_SUBJECT, OUTPUT_SUBJECT } from '../../../../packages/events/src/index.ts';
+import { CONSUMER, INPUT_STREAM, INPUT_SUBJECT, OUTPUT_STREAM, FAILURE_SUBJECT } from '../../../../packages/events/src/index.ts';
 import { inputConsumerConfig, provision } from '../../src/provision.ts';
 import { bytes, fixture, receipt } from '../fixtures.ts';
 import { processDelivery } from '../../src/process.ts';
@@ -196,7 +196,9 @@ test('permanent disposition, restart, infrastructure recovery and targeted repla
       env: { ...process.env, NATS_URL: options.servers, NATS_USER: options.user, NATS_PASSWORD: options.pass, NATS_CREDS_FILE: '',
         COMMERCE_BASE_URL: stub.url, COMMERCE_SERVICE_ID: creds.serviceId, COMMERCE_SERVICE_SECRET: creds.secret, COMMERCE_SERVICE_SECRET_FILE: '' },
     });
-    assert.equal(JSON.parse(result.stdout).result, 'persisted');
+    const reported = JSON.parse(result.stdout);
+    assert.equal(reported.result, 'persisted');
+    assert.match(reported.note, /outbox event delivery is not verified/);
     assert.equal(result.stderr.includes(creds.secret), false);
     const attempts = stub.calls.filter(c => c.headers['idempotency-key'] === selected.value.id);
     for (const attempt of attempts) assert.equal(attempt.body, attempts[0]!.body);
@@ -210,10 +212,12 @@ test('permanent disposition, restart, infrastructure recovery and targeted repla
   const afterRecovery = await manager.consumers.info(INPUT_STREAM, CONSUMER);
   assert.deepEqual(afterRecovery.ack_floor, primary.ack_floor);
   assert.equal(afterRecovery.delivered.stream_seq, primary.delivered.stream_seq);
+  // Only the two permanent-failure diagnostics exist; successful processing and recovery publish no event.
   const outcomes = await manager.streams.info(OUTPUT_STREAM);
-  assert.ok(outcomes.state.messages > 0);
-  const final = await manager.streams.getMessage(OUTPUT_STREAM, { seq: outcomes.state.last_seq });
-  assert.equal(final?.subject, OUTPUT_SUBJECT);
+  assert.equal(outcomes.state.messages, 2);
+  for (let seq = outcomes.state.first_seq; seq <= outcomes.state.last_seq; seq++) {
+    assert.equal((await manager.streams.getMessage(OUTPUT_STREAM, { seq }))?.subject, FAILURE_SUBJECT);
+  }
 });
 
 test('actual worker exits on systemic authorization failure without rejecting the queued customer behind it', { timeout: 20_000 }, async t => {

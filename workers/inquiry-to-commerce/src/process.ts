@@ -1,4 +1,4 @@
-import { persistedEvent, processingFailedEvent, FAILURE_SUBJECT, OUTPUT_STREAM, OUTPUT_SUBJECT } from '../../../packages/events/src/index.ts';
+import { processingFailedEvent, FAILURE_SUBJECT, OUTPUT_STREAM } from '../../../packages/events/src/index.ts';
 import type { InquiryReceipt } from '../../../packages/events/src/index.ts';
 import type { CommerceRequest } from './transform.ts';
 import { commerceRequest, parseSubmitted, isObject, isUuid } from './transform.ts';
@@ -31,10 +31,8 @@ export async function processDelivery(message: Delivery, deps: Dependencies, sig
     deps.log('info', 'inquiry_received', identifiers());
     const receipt = await deps.commerce.createInquiry(event.id, commerceRequest(event), signal);
     deps.log('info', 'commerce_persisted', { ...identifiers(), inquiryId: receipt.id });
-    signal.throwIfAborted();
-    const outcome = persistedEvent(event, receipt);
-    const pubAck = await publishConfirmed(OUTPUT_SUBJECT, outcome, deps);
-    deps.log('info', 'outcome_published', { ...identifiers(), outcomeId: outcome.id, duplicate: pubAck.duplicate });
+    // A valid 201 means commerce committed the inquiry, Estimate and its own success outbox event
+    // atomically. This worker neither verifies nor publishes that event.
     signal.throwIfAborted();
     let acknowledged = false;
     try { acknowledged = await message.ackAck({ timeout: 5_000 }); }
